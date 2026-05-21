@@ -173,11 +173,31 @@ func main() {
 	s5filter := flag.String("s5filter", "", "sock5 filter")
 	s5ftfile := flag.String("s5ftfile", "GeoLite2-Country.mmdb", "sock5 filter file")
 	dbPath := flag.String("db", "/opt/pingtunnel/data.db", "database path for multi-user auth (server only)")
+	tcpNoDelay := flag.Int("tcp_nodelay", 1, "enable TCP_NODELAY on TCP sockets")
+	tcpKeepAlive := flag.Int("tcp_keepalive", 1, "enable TCP keepalive on TCP sockets")
+	tcpKeepIdle := flag.Int("tcp_keepidle", 30, "TCP keepalive idle seconds")
+	tcpKeepInterval := flag.Int("tcp_keepintvl", 10, "TCP keepalive probe interval seconds")
+	tcpKeepCount := flag.Int("tcp_keepcnt", 3, "TCP keepalive failed probe count")
+	tcpUserTimeout := flag.Int("tcp_user_timeout", 60000, "TCP user timeout in milliseconds, 0 disables")
+	tcpNotSentLowat := flag.Int("tcp_notsent_lowat", 16384, "TCP_NOTSENT_LOWAT bytes, 0 disables")
+	tcpQuickAck := flag.Int("tcp_quickack", 1, "enable TCP_QUICKACK where supported")
+	tcpMaxSegment := flag.Int("tcp_mss", 0, "TCP_MAXSEG MSS clamp, 0 disables")
 	flag.Usage = func() {
 		fmt.Print(usage)
 	}
 
 	flag.Parse()
+	pingtunnel.ConfigureTCPTuning(pingtunnel.TCPTuningConfig{
+		NoDelay:      *tcpNoDelay > 0,
+		KeepAlive:    *tcpKeepAlive > 0,
+		KeepIdle:     time.Duration(*tcpKeepIdle) * time.Second,
+		KeepInterval: time.Duration(*tcpKeepInterval) * time.Second,
+		KeepCount:    *tcpKeepCount,
+		UserTimeout:  time.Duration(*tcpUserTimeout) * time.Millisecond,
+		NotSentLowat: *tcpNotSentLowat,
+		QuickAck:     *tcpQuickAck > 0,
+		MaxSegment:   *tcpMaxSegment,
+	})
 
 	if *t != "client" && *t != "server" {
 		flag.Usage()

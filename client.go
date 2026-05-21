@@ -316,6 +316,7 @@ func (p *Client) AcceptTcp() error {
 		}
 
 		if conn != nil {
+			tuneTCPConn(conn)
 			if p.open_sock5 > 0 {
 				go p.AcceptSock5Conn(conn)
 			} else {
@@ -1064,6 +1065,7 @@ func (p *Client) AcceptDirectTcpConn(conn *net.TCPConn, targetAddr string) {
 		loggo.Info("direct local tcp DialTCP fail: %s %s", targetAddr, err.Error())
 		return
 	}
+	tuneTCPConn(targetconn)
 
 	go p.transfer(conn, targetconn, conn.RemoteAddr().String(), targetconn.RemoteAddr().String())
 	go p.transfer(targetconn, conn, targetconn.RemoteAddr().String(), conn.RemoteAddr().String())

@@ -72,6 +72,7 @@ func DialThroughProxy(config *ForwardConfig, targetAddr string, timeout time.Dur
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to proxy: %w", err)
 	}
+	tuneTCPConn(conn)
 
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		conn.Close()
@@ -120,6 +121,7 @@ func DialUDPThroughProxy(config *ForwardConfig, timeout time.Duration) (*UDPForw
 		udpConn.Close()
 		return nil, fmt.Errorf("failed to connect to proxy: %w", err)
 	}
+	tuneTCPConn(tcpConn)
 
 	closeAllWithErr := func(cause error) (*UDPForwardAssociation, error) {
 		tcpConn.Close()

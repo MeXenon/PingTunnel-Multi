@@ -431,6 +431,7 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 			p.addConnError(addr)
 			return nil
 		}
+		tuneTCPConn(c)
 		var ipaddrTarget *net.TCPAddr
 		if p.forwardConfig != nil {
 			ipaddrTarget, _ = net.ResolveTCPAddr("tcp", addr)
