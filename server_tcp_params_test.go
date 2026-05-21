@@ -58,17 +58,17 @@ func TestSanitizeServerTCPParamsHonorsServerOverrides(t *testing.T) {
 func TestServerReplyTokensDefaultToOneReplyPerClientPacket(t *testing.T) {
 	t.Setenv(serverICMPReplyBurstEnv, "")
 
-	conn := &ServerConn{}
-	conn.queueReplyTokens(100, 200)
+	server := &Server{replyTokens: make(map[string][]icmpReplyToken)}
+	server.queueReplyTokens("client#1", 100, 200)
 
-	token, ok := conn.popReplyToken()
+	token, ok := server.popReplyToken("client#1")
 	if !ok {
 		t.Fatal("expected one reply token")
 	}
 	if token.id != 100 || token.seq != 200 {
 		t.Fatalf("unexpected token: %#v", token)
 	}
-	if _, ok := conn.popReplyToken(); ok {
+	if _, ok := server.popReplyToken("client#1"); ok {
 		t.Fatal("expected default mobile-safe burst to emit one token")
 	}
 }
@@ -76,11 +76,11 @@ func TestServerReplyTokensDefaultToOneReplyPerClientPacket(t *testing.T) {
 func TestServerReplyTokensHonorBoundedBurstOverride(t *testing.T) {
 	t.Setenv(serverICMPReplyBurstEnv, "3")
 
-	conn := &ServerConn{}
-	conn.queueReplyTokens(7, 9)
+	server := &Server{replyTokens: make(map[string][]icmpReplyToken)}
+	server.queueReplyTokens("client#1", 7, 9)
 
 	for i := 0; i < 3; i++ {
-		token, ok := conn.popReplyToken()
+		token, ok := server.popReplyToken("client#1")
 		if !ok {
 			t.Fatalf("missing token %d", i)
 		}
@@ -88,8 +88,32 @@ func TestServerReplyTokensHonorBoundedBurstOverride(t *testing.T) {
 			t.Fatalf("unexpected token %d: %#v", i, token)
 		}
 	}
-	if _, ok := conn.popReplyToken(); ok {
+	if _, ok := server.popReplyToken("client#1"); ok {
 		t.Fatal("expected exactly three reply tokens")
+	}
+}
+
+func TestServerReplyTokensAreScopedByClientSession(t *testing.T) {
+	t.Setenv(serverICMPReplyBurstEnv, "")
+
+	server := &Server{replyTokens: make(map[string][]icmpReplyToken)}
+	server.queueReplyTokens("192.0.2.1#100", 100, 1)
+	server.queueReplyTokens("192.0.2.1#200", 200, 1)
+
+	token, ok := server.popReplyToken("192.0.2.1#100")
+	if !ok {
+		t.Fatal("expected token for first client")
+	}
+	if token.id != 100 {
+		t.Fatalf("token leaked across echo ids: %#v", token)
+	}
+
+	token, ok = server.popReplyToken("192.0.2.1#200")
+	if !ok {
+		t.Fatal("expected token for second client")
+	}
+	if token.id != 200 {
+		t.Fatalf("token leaked across echo ids: %#v", token)
 	}
 }
 

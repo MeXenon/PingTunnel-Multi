@@ -42,6 +42,7 @@ func NewServerWithDBForward(icmpAddr string, key int, maxconn int, maxprocessthr
 		forwardConfig:    forwardConfig,
 		useMultiAuth:     false,
 		connToUser:       make(map[string]int64),
+		replyTokens:      make(map[string][]icmpReplyToken),
 	}
 
 	// Initialize auth manager if database path provided
@@ -120,36 +121,95 @@ func readBoundedPositiveIntEnv(name string, fallback int, max int) int {
 	return value
 }
 
-func (conn *ServerConn) queueReplyTokens(echoId int, echoSeq int) {
+func replyTokenSourceKey(src *net.IPAddr, echoId int) string {
+	if src == nil {
+		return fmt.Sprintf("#%d", echoId)
+	}
+	return fmt.Sprintf("%s#%d", src.String(), echoId)
+}
+
+func (p *Server) queueReplyTokens(sourceKey string, echoId int, echoSeq int) {
+	if sourceKey == "" {
+		return
+	}
 	burst := readBoundedPositiveIntEnv(serverICMPReplyBurstEnv, serverICMPDefaultReplyBurst, serverICMPMaxReplyBurst)
-	conn.replyTokenMu.Lock()
-	defer conn.replyTokenMu.Unlock()
+	p.replyTokenMu.Lock()
+	defer p.replyTokenMu.Unlock()
 
+	if p.replyTokens == nil {
+		p.replyTokens = make(map[string][]icmpReplyToken)
+	}
+	tokens := p.replyTokens[sourceKey]
 	for i := 0; i < burst; i++ {
-		conn.replyTokens = append(conn.replyTokens, icmpReplyToken{id: echoId, seq: echoSeq})
+		tokens = append(tokens, icmpReplyToken{id: echoId, seq: echoSeq})
 	}
-	if len(conn.replyTokens) > serverICMPMaxReplyTokens {
-		conn.replyTokens = conn.replyTokens[len(conn.replyTokens)-serverICMPMaxReplyTokens:]
+	if len(tokens) > serverICMPMaxReplyTokens {
+		tokens = tokens[len(tokens)-serverICMPMaxReplyTokens:]
 	}
+	p.replyTokens[sourceKey] = tokens
 }
 
-func (conn *ServerConn) hasReplyToken() bool {
-	conn.replyTokenMu.Lock()
-	defer conn.replyTokenMu.Unlock()
-	return len(conn.replyTokens) > 0
+func (p *Server) hasReplyToken(sourceKey string) bool {
+	p.replyTokenMu.Lock()
+	defer p.replyTokenMu.Unlock()
+	return len(p.replyTokens[sourceKey]) > 0
 }
 
-func (conn *ServerConn) popReplyToken() (icmpReplyToken, bool) {
-	conn.replyTokenMu.Lock()
-	defer conn.replyTokenMu.Unlock()
+func (p *Server) popReplyToken(sourceKey string) (icmpReplyToken, bool) {
+	p.replyTokenMu.Lock()
+	defer p.replyTokenMu.Unlock()
 
-	if len(conn.replyTokens) == 0 {
+	tokens := p.replyTokens[sourceKey]
+	if len(tokens) == 0 {
 		return icmpReplyToken{}, false
 	}
-	token := conn.replyTokens[0]
-	copy(conn.replyTokens, conn.replyTokens[1:])
-	conn.replyTokens = conn.replyTokens[:len(conn.replyTokens)-1]
+	token := tokens[0]
+	copy(tokens, tokens[1:])
+	tokens = tokens[:len(tokens)-1]
+	if len(tokens) == 0 {
+		delete(p.replyTokens, sourceKey)
+	} else {
+		p.replyTokens[sourceKey] = tokens
+	}
 	return token, true
+}
+
+func (p *Server) clearReplyTokens(sourceKey string) {
+	if sourceKey == "" {
+		return
+	}
+	p.replyTokenMu.Lock()
+	delete(p.replyTokens, sourceKey)
+	p.replyTokenMu.Unlock()
+}
+
+func (p *Server) hasActiveTCPConnForSource(sourceKey string) bool {
+	if sourceKey == "" {
+		return false
+	}
+	found := false
+	p.localConnMap.Range(func(_, value interface{}) bool {
+		conn := value.(*ServerConn)
+		if !conn.exit && conn.tcpmode > 0 && conn.sourceKey == sourceKey {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func (p *Server) notifyTCPConnsForSource(sourceKey string) {
+	if sourceKey == "" {
+		return
+	}
+	p.localConnMap.Range(func(_, value interface{}) bool {
+		conn := value.(*ServerConn)
+		if !conn.exit && conn.tcpmode > 0 && conn.sourceKey == sourceKey {
+			notifyActivity(conn.activity)
+		}
+		return true
+	})
 }
 
 func prioritizeServerFrames(sendlist *list.List) []*network.Frame {
@@ -167,7 +227,7 @@ func prioritizeServerFrames(sendlist *list.List) []*network.Frame {
 }
 
 func (p *Server) sendTCPFrame(conn *ServerConn, src *net.IPAddr, f *network.Frame, responseKey int) bool {
-	token, ok := conn.popReplyToken()
+	token, ok := p.popReplyToken(conn.sourceKey)
 	if !ok {
 		return false
 	}
@@ -222,6 +282,9 @@ type Server struct {
 	authManager  *AuthManager
 	connToUser   map[string]int64 // connection ID -> user ID
 	connUserMu   sync.RWMutex
+
+	replyTokenMu sync.Mutex
+	replyTokens  map[string][]icmpReplyToken
 }
 
 type ServerConn struct {
@@ -243,8 +306,7 @@ type ServerConn struct {
 	tcpmode        int
 	echoId         int
 	echoSeq        int
-	replyTokenMu   sync.Mutex
-	replyTokens    []icmpReplyToken
+	sourceKey      string
 	activity       chan struct{}
 
 	// Multi-user tracking
@@ -360,10 +422,18 @@ func (p *Server) processPacket(packet *Packet) {
 		}
 	}
 
+	sourceKey := replyTokenSourceKey(packet.src, packet.echoId)
+
 	if packet.my.Type == (int32)(MyMsg_PING) {
 		t := time.Time{}
 		t.UnmarshalBinary(packet.my.Data)
 		loggo.Info("ping from %s %s %d %d %d", packet.src.String(), t.String(), packet.my.Rproto, packet.echoId, packet.echoSeq)
+
+		if p.hasActiveTCPConnForSource(sourceKey) {
+			p.queueReplyTokens(sourceKey, packet.echoId, packet.echoSeq)
+			p.notifyTCPConnsForSource(sourceKey)
+			return
+		}
 
 		// Use the validated key for response
 		responseKey := p.key
@@ -377,6 +447,8 @@ func (p *Server) processPacket(packet *Packet) {
 			0, p.cryptoConfig)
 		return
 	}
+
+	p.queueReplyTokens(sourceKey, packet.echoId, packet.echoSeq)
 
 	if packet.my.Type == (int32)(MyMsg_KICK) {
 		localConn := p.getServerConnById(packet.my.Id)
@@ -472,7 +544,7 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 			(int)(packet.my.TcpmodeStat))
 
 		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpconn: c, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
-			rproto: (int)(packet.my.Rproto), fm: fm, tcpmode: (int)(packet.my.Tcpmode), activity: make(chan struct{}, 1), userID: userID, userKey: userKey}
+			rproto: (int)(packet.my.Rproto), fm: fm, tcpmode: (int)(packet.my.Tcpmode), sourceKey: replyTokenSourceKey(packet.src, packet.echoId), activity: make(chan struct{}, 1), userID: userID, userKey: userKey}
 
 		p.addServerConn(id, localConn)
 
@@ -527,6 +599,7 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 				close:          false,
 				rproto:         (int)(packet.my.Rproto),
 				tcpmode:        (int)(packet.my.Tcpmode),
+				sourceKey:      replyTokenSourceKey(packet.src, packet.echoId),
 				userID:         userID,
 				userKey:        userKey,
 			}
@@ -547,7 +620,7 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 		ipaddrTarget := targetConn.RemoteAddr().(*net.UDPAddr)
 
 		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), conn: targetConn, ipaddrTarget: ipaddrTarget, udpTargetAddr: addr, id: id, activeRecvTime: now, activeSendTime: now, close: false,
-			rproto: (int)(packet.my.Rproto), tcpmode: (int)(packet.my.Tcpmode), userID: userID, userKey: userKey}
+			rproto: (int)(packet.my.Rproto), tcpmode: (int)(packet.my.Tcpmode), sourceKey: replyTokenSourceKey(packet.src, packet.echoId), userID: userID, userKey: userKey}
 
 		p.addServerConn(id, localConn)
 
@@ -626,8 +699,8 @@ func (p *Server) processDataPacket(packet *Packet) {
 	localConn.activeRecvTime = now
 	localConn.echoId = packet.echoId
 	localConn.echoSeq = packet.echoSeq
-	if localConn.tcpmode > 0 {
-		localConn.queueReplyTokens(packet.echoId, packet.echoSeq)
+	if localConn.sourceKey == "" {
+		localConn.sourceKey = replyTokenSourceKey(packet.src, packet.echoId)
 	}
 
 	if packet.my.Type == (int32)(MyMsg_DATA) {
@@ -710,7 +783,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 		}
 		conn.fm.Update()
 		hadWork := false
-		if conn.hasReplyToken() {
+		if p.hasReplyToken(conn.sourceKey) {
 			sendlist := conn.fm.GetSendList()
 			for _, f := range prioritizeServerFrames(sendlist) {
 				if !p.sendTCPFrame(conn, src, f, responseKey) {
@@ -805,7 +878,7 @@ mainLoop:
 
 		conn.fm.Update()
 
-		if conn.hasReplyToken() {
+		if p.hasReplyToken(conn.sourceKey) {
 			sendlist := conn.fm.GetSendList()
 			conn.activeSendTime = now
 			for _, f := range prioritizeServerFrames(sendlist) {
@@ -888,7 +961,7 @@ mainLoop:
 
 		conn.fm.Update()
 
-		if conn.hasReplyToken() {
+		if p.hasReplyToken(conn.sourceKey) {
 			sendlist := conn.fm.GetSendList()
 			for _, f := range prioritizeServerFrames(sendlist) {
 				if !p.sendTCPFrame(conn, src, f, responseKey) {
@@ -1012,6 +1085,9 @@ func (p *Server) close(conn *ServerConn) {
 			p.connUserMu.Lock()
 			delete(p.connToUser, conn.id)
 			p.connUserMu.Unlock()
+		}
+		if conn.sourceKey != "" && !p.hasActiveTCPConnForSource(conn.sourceKey) {
+			p.clearReplyTokens(conn.sourceKey)
 		}
 	}
 }
