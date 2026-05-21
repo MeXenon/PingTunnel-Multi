@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/esrrhs/gohome/loggo"
+	"github.com/esrrhs/pingtunnel/internal/loggo"
 	_ "github.com/mattn/go-sqlite3"
 )
 

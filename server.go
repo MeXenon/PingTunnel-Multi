@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/esrrhs/gohome/common"
-	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/network"
 	"github.com/esrrhs/gohome/thread"
+	"github.com/esrrhs/pingtunnel/internal/loggo"
 	oldproto "github.com/golang/protobuf/proto"
 	"golang.org/x/net/icmp"
 )
