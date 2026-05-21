@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +64,47 @@ func NewServerWithDBForward(icmpAddr string, key int, maxconn int, maxprocessthr
 	}
 
 	return s, nil
+}
+
+const (
+	serverTCPDefaultBufferSize      = 1024 * 1024
+	serverTCPDefaultMaxWindow       = 128
+	serverTCPDefaultMinResendMillis = 1000
+	serverTCPMaxWindowEnv           = "PINGTUNNEL_SERVER_TCP_MAXWIN"
+	serverTCPMinResendMillisEnv     = "PINGTUNNEL_SERVER_TCP_MIN_RESEND_MS"
+)
+
+func sanitizeServerTCPParams(bufferSize int, windowSize int, resendMillis int) (int, int, int) {
+	if bufferSize <= 0 {
+		bufferSize = serverTCPDefaultBufferSize
+	}
+
+	maxWindow := readPositiveIntEnv(serverTCPMaxWindowEnv, serverTCPDefaultMaxWindow)
+	if maxWindow > FRAME_MAX_ID/10 {
+		maxWindow = FRAME_MAX_ID / 10
+	}
+	if windowSize <= 0 || windowSize > maxWindow {
+		windowSize = maxWindow
+	}
+
+	minResendMillis := readPositiveIntEnv(serverTCPMinResendMillisEnv, serverTCPDefaultMinResendMillis)
+	if resendMillis <= 0 || resendMillis < minResendMillis {
+		resendMillis = minResendMillis
+	}
+
+	return bufferSize, windowSize, resendMillis
+}
+
+func readPositiveIntEnv(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
 
 type Server struct {
@@ -334,7 +377,8 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 			ipaddrTarget = &net.TCPAddr{}
 		}
 
-		fm := network.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, (int)(packet.my.TcpmodeBuffersize), (int)(packet.my.TcpmodeMaxwin), (int)(packet.my.TcpmodeResendTimems), (int)(packet.my.TcpmodeCompress),
+		tcpBufferSize, tcpMaxWindow, tcpResendMillis := sanitizeServerTCPParams((int)(packet.my.TcpmodeBuffersize), (int)(packet.my.TcpmodeMaxwin), (int)(packet.my.TcpmodeResendTimems))
+		fm := network.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, tcpBufferSize, tcpMaxWindow, tcpResendMillis, (int)(packet.my.TcpmodeCompress),
 			(int)(packet.my.TcpmodeStat))
 
 		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpconn: c, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
