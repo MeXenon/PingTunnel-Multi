@@ -163,11 +163,17 @@ func DialUDPThroughProxy(config *ForwardConfig, timeout time.Duration) (*UDPForw
 }
 
 func normalizeSocks5UDPRelayAddr(relayAddr *net.UDPAddr, proxyRemote net.Addr) *net.UDPAddr {
-	if relayAddr == nil || relayAddr.IP == nil || !relayAddr.IP.IsUnspecified() {
+	if relayAddr == nil || relayAddr.IP == nil {
+		return relayAddr
+	}
+	if !relayAddr.IP.IsUnspecified() && !relayAddr.IP.IsLoopback() {
 		return relayAddr
 	}
 	tcpRemote, ok := proxyRemote.(*net.TCPAddr)
 	if !ok || tcpRemote.IP == nil || tcpRemote.IP.IsUnspecified() {
+		return relayAddr
+	}
+	if relayAddr.IP.IsLoopback() && tcpRemote.IP.IsLoopback() {
 		return relayAddr
 	}
 	return &net.UDPAddr{IP: tcpRemote.IP, Port: relayAddr.Port, Zone: relayAddr.Zone}

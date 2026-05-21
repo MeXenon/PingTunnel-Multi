@@ -231,6 +231,31 @@ func TestDialUDPThroughProxyNormalizesUnspecifiedRelayAddress(t *testing.T) {
 	<-done
 }
 
+func TestNormalizeSocks5UDPRelayAddressRewritesRemoteLoopback(t *testing.T) {
+	relay := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 53000}
+	remote := &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 1080}
+
+	got := normalizeSocks5UDPRelayAddr(relay, remote)
+
+	if got.IP.String() != "203.0.113.10" {
+		t.Fatalf("relay ip was not normalized: %s", got.String())
+	}
+	if got.Port != 53000 {
+		t.Fatalf("unexpected relay port: %d", got.Port)
+	}
+}
+
+func TestNormalizeSocks5UDPRelayAddressKeepsLocalLoopback(t *testing.T) {
+	relay := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 53000}
+	remote := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1080}
+
+	got := normalizeSocks5UDPRelayAddr(relay, remote)
+
+	if got.IP.String() != "127.0.0.1" {
+		t.Fatalf("local relay ip should stay loopback: %s", got.String())
+	}
+}
+
 func TestExchangeDNSOverTCPViaProxy(t *testing.T) {
 	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
