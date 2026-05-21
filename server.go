@@ -1,6 +1,7 @@
 package pingtunnel
 
 import (
+	"container/list"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -72,6 +73,10 @@ const (
 	serverTCPDefaultMinResendMillis = 1000
 	serverTCPMaxWindowEnv           = "PINGTUNNEL_SERVER_TCP_MAXWIN"
 	serverTCPMinResendMillisEnv     = "PINGTUNNEL_SERVER_TCP_MIN_RESEND_MS"
+	serverICMPDefaultReplyBurst     = 1
+	serverICMPMaxReplyBurst         = 16
+	serverICMPMaxReplyTokens        = 4096
+	serverICMPReplyBurstEnv         = "PINGTUNNEL_SERVER_ICMP_REPLY_BURST"
 )
 
 func sanitizeServerTCPParams(bufferSize int, windowSize int, resendMillis int) (int, int, int) {
@@ -105,6 +110,84 @@ func readPositiveIntEnv(name string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func readBoundedPositiveIntEnv(name string, fallback int, max int) int {
+	value := readPositiveIntEnv(name, fallback)
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func (conn *ServerConn) queueReplyTokens(echoId int, echoSeq int) {
+	burst := readBoundedPositiveIntEnv(serverICMPReplyBurstEnv, serverICMPDefaultReplyBurst, serverICMPMaxReplyBurst)
+	conn.replyTokenMu.Lock()
+	defer conn.replyTokenMu.Unlock()
+
+	for i := 0; i < burst; i++ {
+		conn.replyTokens = append(conn.replyTokens, icmpReplyToken{id: echoId, seq: echoSeq})
+	}
+	if len(conn.replyTokens) > serverICMPMaxReplyTokens {
+		conn.replyTokens = conn.replyTokens[len(conn.replyTokens)-serverICMPMaxReplyTokens:]
+	}
+}
+
+func (conn *ServerConn) hasReplyToken() bool {
+	conn.replyTokenMu.Lock()
+	defer conn.replyTokenMu.Unlock()
+	return len(conn.replyTokens) > 0
+}
+
+func (conn *ServerConn) popReplyToken() (icmpReplyToken, bool) {
+	conn.replyTokenMu.Lock()
+	defer conn.replyTokenMu.Unlock()
+
+	if len(conn.replyTokens) == 0 {
+		return icmpReplyToken{}, false
+	}
+	token := conn.replyTokens[0]
+	copy(conn.replyTokens, conn.replyTokens[1:])
+	conn.replyTokens = conn.replyTokens[:len(conn.replyTokens)-1]
+	return token, true
+}
+
+func prioritizeServerFrames(sendlist *list.List) []*network.Frame {
+	dataFrames := make([]*network.Frame, 0, sendlist.Len())
+	otherFrames := make([]*network.Frame, 0)
+	for e := sendlist.Front(); e != nil; e = e.Next() {
+		f := e.Value.(*network.Frame)
+		if f.Type == int32(network.Frame_DATA) {
+			dataFrames = append(dataFrames, f)
+		} else {
+			otherFrames = append(otherFrames, f)
+		}
+	}
+	return append(dataFrames, otherFrames...)
+}
+
+func (p *Server) sendTCPFrame(conn *ServerConn, src *net.IPAddr, f *network.Frame, responseKey int) bool {
+	token, ok := conn.popReplyToken()
+	if !ok {
+		return false
+	}
+
+	mb, err := conn.fm.MarshalFrame(f)
+	if err != nil {
+		loggo.Error("Error tcp Marshal %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
+		return false
+	}
+	sendICMP(token.id, token.seq, *p.conn, src, "", conn.id, (uint32)(MyMsg_DATA), mb,
+		conn.rproto, -1, responseKey, 0,
+		0, 0, 0, 0, 0,
+		0, p.cryptoConfig)
+	p.sendPacket++
+	p.sendPacketSize += (uint64)(len(mb))
+
+	if p.useMultiAuth && p.authManager != nil && conn.userID != 0 {
+		p.authManager.AddTraffic(conn.userID, int64(len(mb)), 0)
+	}
+	return true
 }
 
 type Server struct {
@@ -160,11 +243,18 @@ type ServerConn struct {
 	tcpmode        int
 	echoId         int
 	echoSeq        int
+	replyTokenMu   sync.Mutex
+	replyTokens    []icmpReplyToken
 	activity       chan struct{}
 
 	// Multi-user tracking
 	userID  int64
 	userKey int
+}
+
+type icmpReplyToken struct {
+	id  int
+	seq int
 }
 
 func (p *Server) Run() error {
@@ -536,6 +626,9 @@ func (p *Server) processDataPacket(packet *Packet) {
 	localConn.activeRecvTime = now
 	localConn.echoId = packet.echoId
 	localConn.echoSeq = packet.echoSeq
+	if localConn.tcpmode > 0 {
+		localConn.queueReplyTokens(packet.echoId, packet.echoSeq)
+	}
 
 	if packet.my.Type == (int32)(MyMsg_DATA) {
 
@@ -616,21 +709,14 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 			break
 		}
 		conn.fm.Update()
-		sendlist := conn.fm.GetSendList()
-		hadWork := sendlist.Len() > 0
-		for e := sendlist.Front(); e != nil; e = e.Next() {
-			f := e.Value.(*network.Frame)
-			mb, _ := conn.fm.MarshalFrame(f)
-			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
-				conn.rproto, -1, responseKey, 0,
-				0, 0, 0, 0, 0,
-				0, p.cryptoConfig)
-			p.sendPacket++
-			p.sendPacketSize += (uint64)(len(mb))
-
-			// Track sent traffic
-			if p.useMultiAuth && p.authManager != nil && conn.userID != 0 {
-				p.authManager.AddTraffic(conn.userID, int64(len(mb)), 0)
+		hadWork := false
+		if conn.hasReplyToken() {
+			sendlist := conn.fm.GetSendList()
+			for _, f := range prioritizeServerFrames(sendlist) {
+				if !p.sendTCPFrame(conn, src, f, responseKey) {
+					break
+				}
+				hadWork = true
 			}
 		}
 		time.Sleep(time.Millisecond * 10)
@@ -710,6 +796,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 	}()
 
 	loopWait := newAdaptiveLoopWait(2*time.Millisecond, 250*time.Millisecond)
+	remoteInputClosed := false
 
 mainLoop:
 	for !p.exit && !conn.exit {
@@ -718,28 +805,14 @@ mainLoop:
 
 		conn.fm.Update()
 
-		sendlist := conn.fm.GetSendList()
-		if sendlist.Len() > 0 {
-			hadWork = true
+		if conn.hasReplyToken() {
+			sendlist := conn.fm.GetSendList()
 			conn.activeSendTime = now
-			for e := sendlist.Front(); e != nil; e = e.Next() {
-				f := e.Value.(*network.Frame)
-				mb, err := conn.fm.MarshalFrame(f)
-				if err != nil {
-					loggo.Error("Error tcp Marshal %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
-					continue
+			for _, f := range prioritizeServerFrames(sendlist) {
+				if !p.sendTCPFrame(conn, src, f, responseKey) {
+					break
 				}
-				sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
-					conn.rproto, -1, responseKey, 0,
-					0, 0, 0, 0, 0,
-					0, p.cryptoConfig)
-				p.sendPacket++
-				p.sendPacketSize += (uint64)(len(mb))
-
-				// Track sent traffic
-				if p.useMultiAuth && p.authManager != nil && conn.userID != 0 {
-					p.authManager.AddTraffic(conn.userID, int64(len(mb)), 0)
-				}
+				hadWork = true
 			}
 		}
 
@@ -762,6 +835,11 @@ mainLoop:
 			}
 		}
 
+		if conn.fm.IsRemoteClosed() && !remoteInputClosed && conn.fm.GetRecvBufferSize() == 0 {
+			remoteInputClosed = true
+			loggo.Info("remote finished sending conn %s %s", conn.id, conn.tcpaddrTarget.String())
+		}
+
 		select {
 		case err := <-readErr:
 			if err != nil {
@@ -779,12 +857,6 @@ mainLoop:
 		if diffrecv > time.Second*(time.Duration(conn.timeout)) || diffsend > time.Second*(time.Duration(conn.timeout)) ||
 			(tcpdiffrecv > time.Second*(time.Duration(conn.timeout)) && tcpdiffsend > time.Second*(time.Duration(conn.timeout))) {
 			loggo.Info("close inactive conn %s %s", conn.id, conn.tcpaddrTarget.String())
-			conn.fm.Close()
-			break
-		}
-
-		if conn.fm.IsRemoteClosed() {
-			loggo.Info("closed by remote conn %s %s", conn.id, conn.tcpaddrTarget.String())
 			conn.fm.Close()
 			break
 		}
@@ -816,20 +888,12 @@ mainLoop:
 
 		conn.fm.Update()
 
-		sendlist := conn.fm.GetSendList()
-		for e := sendlist.Front(); e != nil; e = e.Next() {
-			f := e.Value.(*network.Frame)
-			mb, _ := conn.fm.MarshalFrame(f)
-			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
-				conn.rproto, -1, responseKey, 0,
-				0, 0, 0, 0, 0,
-				0, p.cryptoConfig)
-			p.sendPacket++
-			p.sendPacketSize += (uint64)(len(mb))
-
-			// Track sent traffic
-			if p.useMultiAuth && p.authManager != nil && conn.userID != 0 {
-				p.authManager.AddTraffic(conn.userID, int64(len(mb)), 0)
+		if conn.hasReplyToken() {
+			sendlist := conn.fm.GetSendList()
+			for _, f := range prioritizeServerFrames(sendlist) {
+				if !p.sendTCPFrame(conn, src, f, responseKey) {
+					break
+				}
 			}
 		}
 
