@@ -52,8 +52,9 @@ type AuthManager struct {
 	userCache map[int64]*AuthUser // key -> user
 	mu        sync.RWMutex
 
-	// Session tracking: key -> clientIP
-	activeSessions map[int64]*SessionInfo
+	// Session tracking: key/clientIP -> session. A user key may be active from
+	// multiple client IPs unless an explicit product-level limit is added.
+	activeSessions map[string]*SessionInfo
 	sessionMu      sync.RWMutex
 
 	// Per-user traffic accounting
@@ -71,6 +72,7 @@ type AuthManager struct {
 }
 
 type SessionInfo struct {
+	Key          int64
 	UserID       int64
 	ClientIP     string
 	LastActive   time.Time
@@ -96,7 +98,7 @@ func NewAuthManager(dbPath string) (*AuthManager, error) {
 	am := &AuthManager{
 		db:                      db,
 		userCache:               make(map[int64]*AuthUser),
-		activeSessions:          make(map[int64]*SessionInfo),
+		activeSessions:          make(map[string]*SessionInfo),
 		userTraffic:             make(map[int64]*UserTraffic),
 		flushInterval:           10 * time.Second,
 		userReloadInterval:      userReload,
@@ -189,12 +191,13 @@ func (am *AuthManager) ValidateKey(key int) (*AuthUser, error) {
 	return user, nil
 }
 
-// CanConnect checks if user can connect (single session enforcement)
+// CanConnect checks if user can connect.
 func (am *AuthManager) CanConnect(key int, clientIP string) bool {
 	now := time.Now()
+	sessionID := sessionMapKey(int64(key), clientIP)
 
 	am.sessionMu.RLock()
-	info, exists := am.activeSessions[int64(key)]
+	info, exists := am.activeSessions[sessionID]
 	am.sessionMu.RUnlock()
 
 	if !exists {
@@ -203,42 +206,31 @@ func (am *AuthManager) CanConnect(key int, clientIP string) bool {
 
 	if now.Sub(info.LastActive) > am.sessionTimeout {
 		am.sessionMu.Lock()
-		delete(am.activeSessions, int64(key))
+		delete(am.activeSessions, sessionID)
 		am.sessionMu.Unlock()
-		am.deleteSessionRow(info.UserID)
-		return true
+		am.deleteSessionRow(info.UserID, info.ClientIP)
 	}
 
-	// Allow same IP (reconnection)
-	if info.ClientIP == clientIP {
-		return true
-	}
-
-	// Allow fast handoff if the previous session has been idle briefly
-	if am.sessionHandoffTimeout > 0 && now.Sub(info.LastActive) > am.sessionHandoffTimeout {
-		loggo.Info("Session handoff for key %d from %s to %s after %s idle",
-			key, info.ClientIP, clientIP, now.Sub(info.LastActive).Truncate(time.Millisecond))
-		return true
-	}
-
-	return false
+	return true
 }
 
-// TouchSession updates (or creates) the session entry for a key.
+// TouchSession updates (or creates) the session entry for a key/client IP.
 func (am *AuthManager) TouchSession(key int, userID int64, clientIP string) {
 	now := time.Now()
 	var needsDBUpdate bool
 	var needsInsert bool
+	sessionID := sessionMapKey(int64(key), clientIP)
 
 	am.sessionMu.Lock()
-	info, exists := am.activeSessions[int64(key)]
+	info, exists := am.activeSessions[sessionID]
 	if !exists {
 		info = &SessionInfo{
+			Key:        int64(key),
 			UserID:     userID,
 			ClientIP:   clientIP,
 			LastActive: now,
 		}
-		am.activeSessions[int64(key)] = info
+		am.activeSessions[sessionID] = info
 		am.sessionMu.Unlock()
 		am.upsertSessionRow(info)
 		return
@@ -249,10 +241,6 @@ func (am *AuthManager) TouchSession(key int, userID int64, clientIP string) {
 		info.UserID = userID
 		info.LastDBUpdate = time.Time{}
 		needsInsert = true
-	}
-	if info.ClientIP != clientIP {
-		info.ClientIP = clientIP
-		info.LastDBUpdate = time.Time{}
 	}
 	if now.Sub(info.LastDBUpdate) >= am.sessionDBUpdateInterval {
 		info.LastDBUpdate = now
@@ -364,28 +352,28 @@ func (am *AuthManager) maintenanceLoop() {
 
 func (am *AuthManager) cleanupSessions() {
 	now := time.Now()
-	var staleUserIDs []int64
+	var staleSessions []SessionInfo
 
 	am.sessionMu.Lock()
-	for key, info := range am.activeSessions {
+	for sessionID, info := range am.activeSessions {
 		if now.Sub(info.LastActive) > am.sessionTimeout {
-			delete(am.activeSessions, key)
-			staleUserIDs = append(staleUserIDs, info.UserID)
+			delete(am.activeSessions, sessionID)
+			staleSessions = append(staleSessions, *info)
 			continue
 		}
 
 		am.mu.RLock()
-		_, exists := am.userCache[key]
+		_, exists := am.userCache[info.Key]
 		am.mu.RUnlock()
 		if !exists {
-			delete(am.activeSessions, key)
-			staleUserIDs = append(staleUserIDs, info.UserID)
+			delete(am.activeSessions, sessionID)
+			staleSessions = append(staleSessions, *info)
 		}
 	}
 	am.sessionMu.Unlock()
 
-	for _, userID := range staleUserIDs {
-		am.deleteSessionRow(userID)
+	for _, info := range staleSessions {
+		am.deleteSessionRow(info.UserID, info.ClientIP)
 	}
 }
 
@@ -464,8 +452,8 @@ func (am *AuthManager) upsertSessionRow(info *SessionInfo) {
 	if !am.sessionDBEnabled || info.UserID == 0 {
 		return
 	}
-	connectionID := fmt.Sprintf("user:%d", info.UserID)
-	_, err := am.db.Exec("DELETE FROM active_sessions WHERE user_id = ?", info.UserID)
+	connectionID := sessionConnectionID(info.UserID, info.ClientIP)
+	_, err := am.db.Exec("DELETE FROM active_sessions WHERE user_id = ? AND client_ip = ?", info.UserID, info.ClientIP)
 	if err != nil {
 		loggo.Error("failed to delete old session row: %s", err.Error())
 		return
@@ -485,22 +473,30 @@ func (am *AuthManager) touchSessionRow(info *SessionInfo) {
 	}
 	_, err := am.db.Exec(`
 		UPDATE active_sessions
-		SET client_ip = ?, last_active = CURRENT_TIMESTAMP
-		WHERE user_id = ?
-	`, info.ClientIP, info.UserID)
+		SET last_active = CURRENT_TIMESTAMP
+		WHERE user_id = ? AND client_ip = ?
+	`, info.UserID, info.ClientIP)
 	if err != nil {
 		loggo.Error("failed to update session row: %s", err.Error())
 	}
 }
 
-func (am *AuthManager) deleteSessionRow(userID int64) {
+func (am *AuthManager) deleteSessionRow(userID int64, clientIP string) {
 	if !am.sessionDBEnabled || userID == 0 {
 		return
 	}
-	_, err := am.db.Exec("DELETE FROM active_sessions WHERE user_id = ?", userID)
+	_, err := am.db.Exec("DELETE FROM active_sessions WHERE user_id = ? AND client_ip = ?", userID, clientIP)
 	if err != nil {
 		loggo.Error("failed to delete session row: %s", err.Error())
 	}
+}
+
+func sessionMapKey(key int64, clientIP string) string {
+	return fmt.Sprintf("%d|%s", key, strings.TrimSpace(clientIP))
+}
+
+func sessionConnectionID(userID int64, clientIP string) string {
+	return fmt.Sprintf("user:%d:%s", userID, strings.TrimSpace(clientIP))
 }
 
 func durationFromEnv(key string, fallback time.Duration) time.Duration {
