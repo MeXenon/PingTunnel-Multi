@@ -61,8 +61,8 @@ Usage:
     -maxprb   server最大处理线程buffer数，默认1000
               max process thread's buffer in server, default 1000
 
-    -conntt   server发起连接到目标地址的超时时间，默认1000ms
-              The timeout period for the server to initiate a connection to the destination address. The default is 1000ms.
+    -conntt   server发起连接到目标地址的超时时间，默认10000ms
+              The timeout period for the server to initiate a connection to the destination address. The default is 10000ms.
 
     -forward  通过指定的代理转发TCP/UDP流量，支持 socks5://[user:pass@]host:port 或 http://[user:pass@]host:port
               Forward TCP/UDP traffic through a proxy, e.g. socks5://user:pass@127.0.0.1:2080
@@ -168,7 +168,7 @@ func main() {
 	max_process_thread := flag.Int("maxprt", 100, "max process thread in server")
 	max_process_buffer := flag.Int("maxprb", 1000, "max process thread's buffer in server")
 	profile := flag.Int("profile", 0, "open profile")
-	conntt := flag.Int("conntt", 1000, "the connect call's timeout")
+	conntt := flag.Int("conntt", 10000, "the connect call's timeout")
 	forward := flag.String("forward", "", "forward traffic through proxy (socks5://[user:pass@]host:port or http://[user:pass@]host:port)")
 	s5filter := flag.String("s5filter", "", "sock5 filter")
 	s5ftfile := flag.String("s5ftfile", "GeoLite2-Country.mmdb", "sock5 filter file")

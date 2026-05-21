@@ -155,7 +155,7 @@ func isKeepaliveServerFrame(f *network.Frame) bool {
 func (p *Server) sendTCPFrame(conn *ServerConn, src *net.IPAddr, f *network.Frame, responseKey int) bool {
 	mb, err := conn.fm.MarshalFrame(f)
 	if err != nil {
-		loggo.Error("Error tcp Marshal %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
+		loggo.Error("Error tcp Marshal %s %s %s", conn.id, conn.tcpTargetString(), err)
 		return false
 	}
 	sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", conn.id, (uint32)(MyMsg_DATA), mb,
@@ -214,7 +214,10 @@ type ServerConn struct {
 	udpRelayAddr   *net.UDPAddr
 	udpViaProxy    bool
 	tcpaddrTarget  *net.TCPAddr
+	tcpTargetLabel string
 	tcpconn        net.Conn
+	tcpReady       chan struct{}
+	tcpErr         error
 	id             string
 	activeRecvTime time.Time
 	activeSendTime time.Time
@@ -229,6 +232,26 @@ type ServerConn struct {
 	// Multi-user tracking
 	userID  int64
 	userKey int
+}
+
+func (conn *ServerConn) tcpTargetString() string {
+	if conn == nil {
+		return ""
+	}
+	if conn.tcpTargetLabel != "" {
+		return conn.tcpTargetLabel
+	}
+	if conn.tcpaddrTarget != nil {
+		return conn.tcpaddrTarget.String()
+	}
+	return ""
+}
+
+func (conn *ServerConn) tcpLocalString() string {
+	if conn == nil || conn.tcpconn == nil {
+		return "pending"
+	}
+	return conn.tcpconn.LocalAddr().String()
 }
 
 func (p *Server) Run() error {
@@ -417,39 +440,39 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 	}
 
 	if packet.my.Tcpmode > 0 {
-
-		var c net.Conn
-		var err error
-		if p.forwardConfig != nil {
-			c, err = DialThroughProxy(p.forwardConfig, addr, time.Millisecond*time.Duration(p.connecttmeout))
-		} else {
-			c, err = net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connecttmeout))
-		}
-		if err != nil {
-			loggo.Error("Error listening for tcp packets: %s %s", id, err.Error())
-			p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
-			p.addConnError(addr)
-			return nil
-		}
-		tuneTCPConn(c)
-		var ipaddrTarget *net.TCPAddr
-		if p.forwardConfig != nil {
-			ipaddrTarget, _ = net.ResolveTCPAddr("tcp", addr)
-		} else {
-			ipaddrTarget = c.RemoteAddr().(*net.TCPAddr)
-		}
-		if ipaddrTarget == nil {
-			ipaddrTarget = &net.TCPAddr{}
-		}
-
 		tcpBufferSize, tcpMaxWindow, tcpResendMillis := sanitizeServerTCPParams((int)(packet.my.TcpmodeBuffersize), (int)(packet.my.TcpmodeMaxwin), (int)(packet.my.TcpmodeResendTimems))
 		fm := network.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, tcpBufferSize, tcpMaxWindow, tcpResendMillis, (int)(packet.my.TcpmodeCompress),
 			(int)(packet.my.TcpmodeStat))
 
-		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpconn: c, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
+		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpTargetLabel: addr, tcpReady: make(chan struct{}), id: id, activeRecvTime: now, activeSendTime: now, close: false,
 			rproto: (int)(packet.my.Rproto), fm: fm, tcpmode: (int)(packet.my.Tcpmode), activity: make(chan struct{}, 1), userID: userID, userKey: userKey}
 
 		p.addServerConn(id, localConn)
+
+		go func() {
+			var c net.Conn
+			var err error
+			if p.forwardConfig != nil {
+				c, err = DialThroughProxy(p.forwardConfig, addr, time.Millisecond*time.Duration(p.connecttmeout))
+			} else {
+				c, err = net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connecttmeout))
+			}
+			if err != nil {
+				loggo.Error("Error listening for tcp packets: %s %s", id, err.Error())
+				localConn.tcpErr = err
+				p.addConnError(addr)
+				close(localConn.tcpReady)
+				notifyActivity(localConn.activity)
+				return
+			}
+			tuneTCPConn(c)
+			if tcpAddr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+				localConn.tcpaddrTarget = tcpAddr
+			}
+			localConn.tcpconn = c
+			close(localConn.tcpReady)
+			notifyActivity(localConn.activity)
+		}()
 
 		go p.RecvTCP(localConn, id, packet.src)
 		return localConn
@@ -664,11 +687,16 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 	p.workResultLock.Add(1)
 	defer p.workResultLock.Done()
 
-	loggo.Info("server waiting target response %s -> %s %s", conn.tcpaddrTarget.String(), conn.id, conn.tcpconn.LocalAddr().String())
+	loggo.Info("server waiting target response %s -> %s %s", conn.tcpTargetString(), conn.id, conn.tcpLocalString())
 
-	loggo.Info("start wait remote connect tcp %s %s", conn.id, conn.tcpaddrTarget.String())
+	loggo.Info("start wait remote connect tcp %s %s", conn.id, conn.tcpTargetString())
 	startConnectTime := common.GetNowUpdateInSecond()
 	connectWait := newAdaptiveLoopWait(2*time.Millisecond, 80*time.Millisecond)
+	if conn.tcpReady == nil {
+		conn.tcpReady = make(chan struct{})
+		close(conn.tcpReady)
+	}
+	tcpReadyCh := conn.tcpReady
 
 	// Get the key to use for responses
 	responseKey := p.key
@@ -677,8 +705,16 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 	}
 
 	for !p.exit && !conn.exit {
-		if conn.fm.IsConnected() {
-			break
+		if tcpReadyCh == nil {
+			if conn.tcpErr != nil {
+				loggo.Info("can not connect remote tcp %s %s: %s", conn.id, conn.tcpTargetString(), conn.tcpErr.Error())
+				p.close(conn)
+				p.remoteError(conn.echoId, conn.echoSeq, id, conn.rproto, src, responseKey)
+				return
+			}
+			if conn.fm.IsConnected() && conn.tcpconn != nil {
+				break
+			}
 		}
 		conn.fm.Update()
 		hadWork := false
@@ -692,8 +728,12 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 		time.Sleep(time.Millisecond * 10)
 		now := common.GetNowUpdateInSecond()
 		diffclose := now.Sub(startConnectTime)
-		if diffclose > time.Second*5 {
-			loggo.Info("can not connect remote tcp %s %s", conn.id, conn.tcpaddrTarget.String())
+		connectDeadline := time.Second * time.Duration(conn.timeout)
+		if connectDeadline < 10*time.Second {
+			connectDeadline = 10 * time.Second
+		}
+		if diffclose > connectDeadline {
+			loggo.Info("can not connect remote tcp %s %s", conn.id, conn.tcpTargetString())
 			p.close(conn)
 			p.remoteError(conn.echoId, conn.echoSeq, id, conn.rproto, src, responseKey)
 			return
@@ -706,12 +746,15 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 		select {
 		case <-conn.activity:
 			connectWait.hit()
+		case <-tcpReadyCh:
+			tcpReadyCh = nil
+			connectWait.hit()
 		case <-time.After(wait):
 		}
 	}
 
 	if !conn.exit {
-		loggo.Info("remote connected tcp %s %s", conn.id, conn.tcpaddrTarget.String())
+		loggo.Info("remote connected tcp %s %s", conn.id, conn.tcpTargetString())
 	}
 
 	bytes := make([]byte, 10240)
@@ -794,7 +837,7 @@ mainLoop:
 			if err != nil {
 				nerr, ok := err.(net.Error)
 				if !ok || !nerr.Timeout() {
-					loggo.Info("Error write tcp %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
+					loggo.Info("Error write tcp %s %s %s", conn.id, conn.tcpTargetString(), err)
 					conn.fm.Close()
 					break mainLoop
 				}
@@ -807,13 +850,13 @@ mainLoop:
 
 		if conn.fm.IsRemoteClosed() && !remoteInputClosed && conn.fm.GetRecvBufferSize() == 0 {
 			remoteInputClosed = true
-			loggo.Info("remote finished sending conn %s %s", conn.id, conn.tcpaddrTarget.String())
+			loggo.Info("remote finished sending conn %s %s", conn.id, conn.tcpTargetString())
 		}
 
 		select {
 		case err := <-readErr:
 			if err != nil {
-				loggo.Info("Error read tcp %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
+				loggo.Info("Error read tcp %s %s %s", conn.id, conn.tcpTargetString(), err)
 				conn.fm.Close()
 				break mainLoop
 			}
@@ -826,7 +869,7 @@ mainLoop:
 		tcpdiffsend := now.Sub(tcpActiveSendTime)
 		if diffrecv > time.Second*(time.Duration(conn.timeout)) || diffsend > time.Second*(time.Duration(conn.timeout)) ||
 			(tcpdiffrecv > time.Second*(time.Duration(conn.timeout)) && tcpdiffsend > time.Second*(time.Duration(conn.timeout))) {
-			loggo.Info("close inactive conn %s %s", conn.id, conn.tcpaddrTarget.String())
+			loggo.Info("close inactive conn %s %s", conn.id, conn.tcpTargetString())
 			conn.fm.Close()
 			break
 		}
@@ -838,7 +881,7 @@ mainLoop:
 				loopWait.hit()
 			case err := <-readErr:
 				if err != nil {
-					loggo.Info("Error read tcp %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
+					loggo.Info("Error read tcp %s %s %s", conn.id, conn.tcpTargetString(), err)
 					conn.fm.Close()
 					break mainLoop
 				}
@@ -878,13 +921,13 @@ mainLoop:
 
 		diffclose := now.Sub(startCloseTime)
 		if diffclose > time.Second*60 {
-			loggo.Info("close conn had timeout %s %s", conn.id, conn.tcpaddrTarget.String())
+			loggo.Info("close conn had timeout %s %s", conn.id, conn.tcpTargetString())
 			break
 		}
 
 		remoteclosed := conn.fm.IsRemoteClosed()
 		if remoteclosed && nodatarecv {
-			loggo.Info("remote conn had closed %s %s", conn.id, conn.tcpaddrTarget.String())
+			loggo.Info("remote conn had closed %s %s", conn.id, conn.tcpTargetString())
 			break
 		}
 
@@ -893,7 +936,7 @@ mainLoop:
 
 	time.Sleep(time.Second)
 
-	loggo.Info("close tcp conn %s %s", conn.id, conn.tcpaddrTarget.String())
+	loggo.Info("close tcp conn %s %s", conn.id, conn.tcpTargetString())
 
 	p.close(conn)
 }
