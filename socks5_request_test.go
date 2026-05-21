@@ -173,6 +173,64 @@ func TestDialUDPThroughProxyNoAuth(t *testing.T) {
 	<-done
 }
 
+func TestDialUDPThroughProxyNormalizesUnspecifiedRelayAddress(t *testing.T) {
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer tcpLn.Close()
+
+	udpLn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udpLn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := tcpLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte{socks5Version, 0x00})
+
+		req, err := readSocks5Request(conn)
+		if err != nil || req.Command != socks5CmdUDPAssociate {
+			return
+		}
+		replyAddr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: udpLn.LocalAddr().(*net.UDPAddr).Port}
+		_ = writeSocks5Reply(conn, socks5ReplySucceeded, replyAddr.String())
+	}()
+
+	cfg, err := ParseForwardURL("socks5://" + tcpLn.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseForwardURL returned error: %v", err)
+	}
+	assoc, err := DialUDPThroughProxy(cfg, time.Second)
+	if err != nil {
+		t.Fatalf("DialUDPThroughProxy returned error: %v", err)
+	}
+	defer assoc.ControlConn.Close()
+	defer assoc.UDPConn.Close()
+
+	if assoc.RelayAddr.IP.String() != "127.0.0.1" {
+		t.Fatalf("relay ip was not normalized: %s", assoc.RelayAddr.String())
+	}
+	if assoc.RelayAddr.Port != udpLn.LocalAddr().(*net.UDPAddr).Port {
+		t.Fatalf("unexpected relay port: %d", assoc.RelayAddr.Port)
+	}
+	udpLn.Close()
+	assoc.ControlConn.Close()
+	<-done
+}
+
 func TestExchangeDNSOverTCPViaProxy(t *testing.T) {
 	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

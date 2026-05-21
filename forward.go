@@ -153,12 +153,24 @@ func DialUDPThroughProxy(config *ForwardConfig, timeout time.Duration) (*UDPForw
 	if err != nil {
 		return closeAllWithErr(fmt.Errorf("failed to resolve relay address %q: %w", relayAddrStr, err))
 	}
+	relayAddr = normalizeSocks5UDPRelayAddr(relayAddr, tcpConn.RemoteAddr())
 
 	if err := tcpConn.SetDeadline(time.Time{}); err != nil {
 		return closeAllWithErr(fmt.Errorf("failed to clear deadline: %w", err))
 	}
 
 	return &UDPForwardAssociation{ControlConn: tcpConn, UDPConn: udpConn, RelayAddr: relayAddr}, nil
+}
+
+func normalizeSocks5UDPRelayAddr(relayAddr *net.UDPAddr, proxyRemote net.Addr) *net.UDPAddr {
+	if relayAddr == nil || relayAddr.IP == nil || !relayAddr.IP.IsUnspecified() {
+		return relayAddr
+	}
+	tcpRemote, ok := proxyRemote.(*net.TCPAddr)
+	if !ok || tcpRemote.IP == nil || tcpRemote.IP.IsUnspecified() {
+		return relayAddr
+	}
+	return &net.UDPAddr{IP: tcpRemote.IP, Port: relayAddr.Port, Zone: relayAddr.Zone}
 }
 
 func socks5UDPAssociateAddr(localAddr *net.UDPAddr) string {
