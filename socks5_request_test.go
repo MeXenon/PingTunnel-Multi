@@ -173,6 +173,79 @@ func TestDialUDPThroughProxyNoAuth(t *testing.T) {
 	<-done
 }
 
+func TestExchangeDNSOverTCPViaProxy(t *testing.T) {
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer tcpLn.Close()
+
+	query := []byte{0x12, 0x34, 0x01, 0x00}
+	response := []byte{0x12, 0x34, 0x81, 0x80}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := tcpLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte{socks5Version, 0x00})
+
+		req, err := readSocks5Request(conn)
+		if err != nil || req.Command != socks5CmdConnect || req.Address != "1.1.1.1:53" {
+			return
+		}
+		_ = writeSocks5Reply(conn, socks5ReplySucceeded, "127.0.0.1:0")
+
+		length := make([]byte, 2)
+		if _, err := io.ReadFull(conn, length); err != nil {
+			return
+		}
+		payload := make([]byte, int(length[0])<<8|int(length[1]))
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return
+		}
+		if string(payload) != string(query) {
+			return
+		}
+		reply := []byte{0x00, byte(len(response))}
+		reply = append(reply, response...)
+		_, _ = conn.Write(reply)
+	}()
+
+	cfg, err := ParseForwardURL("socks5://" + tcpLn.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseForwardURL returned error: %v", err)
+	}
+	got, err := exchangeDNSOverTCPViaProxy(cfg, "1.1.1.1:53", query, time.Second)
+	if err != nil {
+		t.Fatalf("exchangeDNSOverTCPViaProxy returned error: %v", err)
+	}
+	if string(got) != string(response) {
+		t.Fatalf("unexpected response: %v", got)
+	}
+	<-done
+}
+
+func TestIsDNSForwardTarget(t *testing.T) {
+	if !isDNSForwardTarget("1.1.1.1:53") {
+		t.Fatal("expected IPv4 DNS target")
+	}
+	if !isDNSForwardTarget("[2606:4700:4700::1111]:53") {
+		t.Fatal("expected IPv6 DNS target")
+	}
+	if isDNSForwardTarget("1.1.1.1:853") {
+		t.Fatal("did not expect non-DNS target")
+	}
+}
+
 type byteReader struct {
 	data []byte
 	off  int

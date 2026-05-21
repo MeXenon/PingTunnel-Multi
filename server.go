@@ -1,7 +1,9 @@
 package pingtunnel
 
 import (
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -350,6 +352,23 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 				return nil
 			}
 
+			if isDNSForwardTarget(addr) {
+				response, dnsErr := exchangeDNSOverTCPViaProxy(p.forwardConfig, addr, packet.my.Data, time.Millisecond*time.Duration(p.connecttmeout))
+				if dnsErr == nil {
+					sendICMP(packet.echoId, packet.echoSeq, *p.conn, packet.src, addr, id, (uint32)(MyMsg_DATA), response,
+						(int)(packet.my.Rproto), -1, responseKey, 0,
+						0, 0, 0, 0, 0,
+						0, p.cryptoConfig)
+					p.sendPacket++
+					p.sendPacketSize += (uint64)(len(response))
+					if p.useMultiAuth && p.authManager != nil && userID != 0 {
+						p.authManager.AddTraffic(userID, int64(len(response)), 0)
+					}
+					return nil
+				}
+				loggo.Error("DNS over TCP proxy fallback failed: %s %s", id, dnsErr.Error())
+			}
+
 			association, err := DialUDPThroughProxy(p.forwardConfig, time.Millisecond*time.Duration(p.connecttmeout))
 			if err != nil {
 				loggo.Error("Error creating udp forward association: %s %s", id, err.Error())
@@ -402,6 +421,55 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 	}
 
 	return nil
+}
+
+func isDNSForwardTarget(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return port == "53"
+}
+
+func exchangeDNSOverTCPViaProxy(config *ForwardConfig, targetAddr string, query []byte, timeout time.Duration) ([]byte, error) {
+	if len(query) == 0 {
+		return nil, fmt.Errorf("empty dns query")
+	}
+	if len(query) > 65535 {
+		return nil, fmt.Errorf("dns query too large: %d", len(query))
+	}
+
+	conn, err := DialThroughProxy(config, targetAddr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, fmt.Errorf("failed to set dns tcp deadline: %w", err)
+	}
+	defer conn.SetDeadline(time.Time{})
+
+	frame := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
+	copy(frame[2:], query)
+	if _, err := conn.Write(frame); err != nil {
+		return nil, fmt.Errorf("failed to write dns tcp query: %w", err)
+	}
+
+	var lengthBuf [2]byte
+	if _, err := io.ReadFull(conn, lengthBuf[:]); err != nil {
+		return nil, fmt.Errorf("failed to read dns tcp response length: %w", err)
+	}
+	length := int(binary.BigEndian.Uint16(lengthBuf[:]))
+	if length <= 0 {
+		return nil, fmt.Errorf("empty dns tcp response")
+	}
+	response := make([]byte, length)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return nil, fmt.Errorf("failed to read dns tcp response: %w", err)
+	}
+	return response, nil
 }
 
 func (p *Server) processDataPacket(packet *Packet) {
