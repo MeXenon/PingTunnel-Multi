@@ -730,32 +730,41 @@ func (p *Client) AcceptSock5Conn(conn *net.TCPConn) {
 		conn.Close()
 		return
 	}
-	_, addr, err := network.Sock5GetRequest(conn)
+	req, err := readSocks5Request(conn)
 	if err != nil {
 		loggo.Error("error getting request: %s", err)
+		_ = writeSocks5Reply(conn, socks5FailureReplyForErr(err), "0.0.0.0:0")
 		conn.Close()
 		return
 	}
+
+	if req.cmd != socks5CmdConnect {
+		_ = writeSocks5Reply(conn, socks5ReplyCmdNA, "0.0.0.0:0")
+		loggo.Info("socks command not supported: cmd=%d addr=%s", req.cmd, req.addr)
+		conn.Close()
+		return
+	}
+
 	// Sending connection established message immediately to client.
-	// This some round trip time for creating socks connection with the client.
-	// But if connection failed, the client will get connection reset error.
-	_, err = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x43})
+	// This saves one round trip during socks connection setup.
+	// The bind address is not meaningful for this proxy path, so return zeroes.
+	err = writeSocks5Reply(conn, socks5ReplySucceeded, "0.0.0.0:0")
 	if err != nil {
 		loggo.Error("send connection confirmation: %s", err)
 		conn.Close()
 		return
 	}
 
-	loggo.Info("accept new sock5 conn: %s", addr)
+	loggo.Info("accept new sock5 conn: %s", req.addr)
 
 	if p.sock5_filter == nil {
-		p.AcceptTcpConn(conn, addr)
+		p.AcceptTcpConn(conn, req.addr)
 	} else {
-		if (*p.sock5_filter)(addr) {
-			p.AcceptTcpConn(conn, addr)
+		if (*p.sock5_filter)(req.addr) {
+			p.AcceptTcpConn(conn, req.addr)
 			return
 		}
-		p.AcceptDirectTcpConn(conn, addr)
+		p.AcceptDirectTcpConn(conn, req.addr)
 	}
 }
 
