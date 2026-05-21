@@ -55,21 +55,23 @@ func TestSanitizeServerTCPParamsHonorsServerOverrides(t *testing.T) {
 	}
 }
 
-func TestServerReplyTokensDefaultToOneReplyPerClientPacket(t *testing.T) {
+func TestServerReplyTokensDefaultToSmallBrowserSafeBurst(t *testing.T) {
 	t.Setenv(serverICMPReplyBurstEnv, "")
 
 	server := &Server{replyTokens: make(map[string][]icmpReplyToken)}
 	server.queueReplyTokens("client#1", 100, 200)
 
-	token, ok := server.popReplyToken("client#1")
-	if !ok {
-		t.Fatal("expected one reply token")
-	}
-	if token.id != 100 || token.seq != 200 {
-		t.Fatalf("unexpected token: %#v", token)
+	for i := 0; i < serverICMPDefaultReplyBurst; i++ {
+		token, ok := server.popReplyToken("client#1")
+		if !ok {
+			t.Fatalf("missing token %d", i)
+		}
+		if token.id != 100 || token.seq != 200+i {
+			t.Fatalf("unexpected token %d: %#v", i, token)
+		}
 	}
 	if _, ok := server.popReplyToken("client#1"); ok {
-		t.Fatal("expected default mobile-safe burst to emit one token")
+		t.Fatalf("expected default burst to emit exactly %d tokens", serverICMPDefaultReplyBurst)
 	}
 }
 
@@ -84,7 +86,7 @@ func TestServerReplyTokensHonorBoundedBurstOverride(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing token %d", i)
 		}
-		if token.id != 7 || token.seq != 9 {
+		if token.id != 7 || token.seq != 9+i {
 			t.Fatalf("unexpected token %d: %#v", i, token)
 		}
 	}
@@ -129,5 +131,23 @@ func TestPrioritizeServerFramesSendsPayloadBeforePureAck(t *testing.T) {
 	}
 	if ordered[0].Type != int32(network.Frame_DATA) {
 		t.Fatalf("first reply should carry payload/control data, got type %d", ordered[0].Type)
+	}
+}
+
+func TestPrioritizeServerFramesDoesNotTreatHeartbeatAsPayload(t *testing.T) {
+	frames := list.New()
+	frames.PushBack(&network.Frame{Type: int32(network.Frame_DATA), Data: &network.FrameData{Type: int32(network.FrameData_HB)}})
+	frames.PushBack(&network.Frame{Type: int32(network.Frame_ACK)})
+	frames.PushBack(&network.Frame{Type: int32(network.Frame_DATA), Data: &network.FrameData{Type: int32(network.FrameData_USER_DATA), Data: []byte("payload")}})
+
+	ordered := prioritizeServerFrames(frames)
+	if len(ordered) != 3 {
+		t.Fatalf("unexpected frame count: %d", len(ordered))
+	}
+	if ordered[0].Data == nil || ordered[0].Data.Type != int32(network.FrameData_USER_DATA) {
+		t.Fatalf("first frame should be user payload, got %#v", ordered[0])
+	}
+	if ordered[2].Data == nil || ordered[2].Data.Type != int32(network.FrameData_HB) {
+		t.Fatalf("heartbeat should be delayed behind payload and ack, got %#v", ordered[2])
 	}
 }

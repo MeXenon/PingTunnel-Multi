@@ -74,7 +74,7 @@ const (
 	serverTCPDefaultMinResendMillis = 1000
 	serverTCPMaxWindowEnv           = "PINGTUNNEL_SERVER_TCP_MAXWIN"
 	serverTCPMinResendMillisEnv     = "PINGTUNNEL_SERVER_TCP_MIN_RESEND_MS"
-	serverICMPDefaultReplyBurst     = 1
+	serverICMPDefaultReplyBurst     = 4
 	serverICMPMaxReplyBurst         = 16
 	serverICMPMaxReplyTokens        = 4096
 	serverICMPReplyBurstEnv         = "PINGTUNNEL_SERVER_ICMP_REPLY_BURST"
@@ -141,7 +141,9 @@ func (p *Server) queueReplyTokens(sourceKey string, echoId int, echoSeq int) {
 	}
 	tokens := p.replyTokens[sourceKey]
 	for i := 0; i < burst; i++ {
-		tokens = append(tokens, icmpReplyToken{id: echoId, seq: echoSeq})
+		// Mobile carriers and kernels can collapse identical echo replies.
+		// The client accepts replies by echo ID, so spread burst replies across sequences.
+		tokens = append(tokens, icmpReplyToken{id: echoId, seq: (echoSeq + i) & 0xffff})
 	}
 	if len(tokens) > serverICMPMaxReplyTokens {
 		tokens = tokens[len(tokens)-serverICMPMaxReplyTokens:]
@@ -213,17 +215,47 @@ func (p *Server) notifyTCPConnsForSource(sourceKey string) {
 }
 
 func prioritizeServerFrames(sendlist *list.List) []*network.Frame {
-	dataFrames := make([]*network.Frame, 0, sendlist.Len())
+	priorityDataFrames := make([]*network.Frame, 0, sendlist.Len())
+	ackFrames := make([]*network.Frame, 0)
+	reqFrames := make([]*network.Frame, 0)
+	keepaliveFrames := make([]*network.Frame, 0)
 	otherFrames := make([]*network.Frame, 0)
 	for e := sendlist.Front(); e != nil; e = e.Next() {
 		f := e.Value.(*network.Frame)
-		if f.Type == int32(network.Frame_DATA) {
-			dataFrames = append(dataFrames, f)
-		} else {
+		switch {
+		case isPriorityServerDataFrame(f):
+			priorityDataFrames = append(priorityDataFrames, f)
+		case f.Type == int32(network.Frame_ACK):
+			ackFrames = append(ackFrames, f)
+		case f.Type == int32(network.Frame_REQ):
+			reqFrames = append(reqFrames, f)
+		case isKeepaliveServerFrame(f):
+			keepaliveFrames = append(keepaliveFrames, f)
+		default:
 			otherFrames = append(otherFrames, f)
 		}
 	}
-	return append(dataFrames, otherFrames...)
+	ordered := append(priorityDataFrames, ackFrames...)
+	ordered = append(ordered, reqFrames...)
+	ordered = append(ordered, otherFrames...)
+	return append(ordered, keepaliveFrames...)
+}
+
+func isPriorityServerDataFrame(f *network.Frame) bool {
+	if f == nil || f.Type != int32(network.Frame_DATA) || f.Data == nil {
+		return false
+	}
+	return f.Data.Type != int32(network.FrameData_HB)
+}
+
+func isKeepaliveServerFrame(f *network.Frame) bool {
+	if f == nil {
+		return false
+	}
+	if f.Type == int32(network.Frame_PING) || f.Type == int32(network.Frame_PONG) {
+		return true
+	}
+	return f.Type == int32(network.Frame_DATA) && f.Data != nil && f.Data.Type == int32(network.FrameData_HB)
 }
 
 func (p *Server) sendTCPFrame(conn *ServerConn, src *net.IPAddr, f *network.Frame, responseKey int) bool {
