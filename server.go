@@ -14,13 +14,16 @@ import (
 	"golang.org/x/net/icmp"
 )
 
-// NewServer creates a new pingtunnel server with optional multi-user auth
 func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig) (*Server, error) {
-	return NewServerWithDB(icmpAddr, key, maxconn, maxprocessthread, maxprocessbuffer, connecttmeout, cryptoConfig, "")
+	return NewServerWithDBForward(icmpAddr, key, maxconn, maxprocessthread, maxprocessbuffer, connecttmeout, cryptoConfig, "", nil)
 }
 
-// NewServerWithDB creates a new server with database-backed authentication
 func NewServerWithDB(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, dbPath string) (*Server, error) {
+	return NewServerWithDBForward(icmpAddr, key, maxconn, maxprocessthread, maxprocessbuffer, connecttmeout, cryptoConfig, dbPath, nil)
+}
+
+// NewServerWithDBForward creates a server with optional multi-user auth and upstream proxy forwarding.
+func NewServerWithDBForward(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, dbPath string, forwardConfig *ForwardConfig) (*Server, error) {
 	s := &Server{
 		icmpAddr:         icmpAddr,
 		exit:             false,
@@ -30,6 +33,7 @@ func NewServerWithDB(icmpAddr string, key int, maxconn int, maxprocessthread int
 		maxprocessbuffer: maxprocessbuffer,
 		connecttmeout:    connecttmeout,
 		cryptoConfig:     cryptoConfig,
+		forwardConfig:    forwardConfig,
 		useMultiAuth:     false,
 		connToUser:       make(map[string]int64),
 	}
@@ -66,6 +70,7 @@ type Server struct {
 	maxprocessbuffer int
 	connecttmeout    int
 	cryptoConfig     *CryptoConfig
+	forwardConfig    *ForwardConfig
 
 	icmpAddr string
 
@@ -95,8 +100,11 @@ type ServerConn struct {
 	timeout        int
 	ipaddrTarget   *net.UDPAddr
 	conn           *net.UDPConn
+	udpTargetAddr  string
+	udpRelayAddr   *net.UDPAddr
+	udpViaProxy    bool
 	tcpaddrTarget  *net.TCPAddr
-	tcpconn        *net.TCPConn
+	tcpconn        net.Conn
 	id             string
 	activeRecvTime time.Time
 	activeSendTime time.Time
@@ -299,20 +307,33 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 
 	if packet.my.Tcpmode > 0 {
 
-		c, err := net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connecttmeout))
+		var c net.Conn
+		var err error
+		if p.forwardConfig != nil {
+			c, err = DialThroughProxy(p.forwardConfig, addr, time.Millisecond*time.Duration(p.connecttmeout))
+		} else {
+			c, err = net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connecttmeout))
+		}
 		if err != nil {
 			loggo.Error("Error listening for tcp packets: %s %s", id, err.Error())
 			p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
 			p.addConnError(addr)
 			return nil
 		}
-		targetConn := c.(*net.TCPConn)
-		ipaddrTarget := targetConn.RemoteAddr().(*net.TCPAddr)
+		var ipaddrTarget *net.TCPAddr
+		if p.forwardConfig != nil {
+			ipaddrTarget, _ = net.ResolveTCPAddr("tcp", addr)
+		} else {
+			ipaddrTarget = c.RemoteAddr().(*net.TCPAddr)
+		}
+		if ipaddrTarget == nil {
+			ipaddrTarget = &net.TCPAddr{}
+		}
 
 		fm := network.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, (int)(packet.my.TcpmodeBuffersize), (int)(packet.my.TcpmodeMaxwin), (int)(packet.my.TcpmodeResendTimems), (int)(packet.my.TcpmodeCompress),
 			(int)(packet.my.TcpmodeStat))
 
-		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpconn: targetConn, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
+		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpconn: c, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
 			rproto: (int)(packet.my.Rproto), fm: fm, tcpmode: (int)(packet.my.Tcpmode), userID: userID, userKey: userKey}
 
 		p.addServerConn(id, localConn)
@@ -321,6 +342,44 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 		return localConn
 
 	} else {
+		if p.forwardConfig != nil {
+			if p.forwardConfig.Scheme != "socks5" {
+				loggo.Error("UDP forwarding requires SOCKS5 proxy, got %s", p.forwardConfig.Scheme)
+				p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
+				p.addConnError(addr)
+				return nil
+			}
+
+			association, err := DialUDPThroughProxy(p.forwardConfig, time.Millisecond*time.Duration(p.connecttmeout))
+			if err != nil {
+				loggo.Error("Error creating udp forward association: %s %s", id, err.Error())
+				p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
+				p.addConnError(addr)
+				return nil
+			}
+
+			localConn := &ServerConn{
+				exit:           false,
+				timeout:        (int)(packet.my.Timeout),
+				conn:           association.UDPConn,
+				udpTargetAddr:  addr,
+				udpRelayAddr:   association.RelayAddr,
+				udpViaProxy:    true,
+				tcpconn:        association.ControlConn,
+				id:             id,
+				activeRecvTime: now,
+				activeSendTime: now,
+				close:          false,
+				rproto:         (int)(packet.my.Rproto),
+				tcpmode:        (int)(packet.my.Tcpmode),
+				userID:         userID,
+				userKey:        userKey,
+			}
+
+			p.addServerConn(id, localConn)
+			go p.Recv(localConn, id, packet.src)
+			return localConn
+		}
 
 		c, err := net.DialTimeout("udp", addr, time.Millisecond*time.Duration(p.connecttmeout))
 		if err != nil {
@@ -332,7 +391,7 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 		targetConn := c.(*net.UDPConn)
 		ipaddrTarget := targetConn.RemoteAddr().(*net.UDPAddr)
 
-		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), conn: targetConn, ipaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
+		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), conn: targetConn, ipaddrTarget: ipaddrTarget, udpTargetAddr: addr, id: id, activeRecvTime: now, activeSendTime: now, close: false,
 			rproto: (int)(packet.my.Rproto), tcpmode: (int)(packet.my.Tcpmode), userID: userID, userKey: userKey}
 
 		p.addServerConn(id, localConn)
@@ -380,7 +439,32 @@ func (p *Server) processDataPacket(packet *Packet) {
 			if packet.my.Data == nil {
 				return
 			}
-			_, err := localConn.conn.Write(packet.my.Data)
+			var err error
+			if localConn.udpViaProxy {
+				targetAddr := localConn.udpTargetAddr
+				if packet.my.Target != "" {
+					targetAddr = packet.my.Target
+				}
+				if targetAddr == "" {
+					loggo.Info("missing udp target for proxied udp conn %s", id)
+					localConn.close = true
+					return
+				}
+				udpPacket, packetErr := buildSocks5UDPDatagram(targetAddr, packet.my.Data)
+				if packetErr != nil {
+					loggo.Info("build socks5 udp datagram error %s", packetErr)
+					localConn.close = true
+					return
+				}
+				if localConn.udpRelayAddr == nil {
+					loggo.Info("missing udp relay addr for proxied udp conn %s", id)
+					localConn.close = true
+					return
+				}
+				_, err = localConn.conn.WriteToUDP(udpPacket, localConn.udpRelayAddr)
+			} else {
+				_, err = localConn.conn.Write(packet.my.Data)
+			}
 			if err != nil {
 				loggo.Info("WriteToUDP Error %s", err)
 				localConn.close = true
@@ -608,7 +692,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 	p.workResultLock.Add(1)
 	defer p.workResultLock.Done()
 
-	loggo.Info("server waiting target response %s -> %s %s", conn.ipaddrTarget.String(), conn.id, conn.conn.LocalAddr().String())
+	loggo.Info("server waiting target response %s -> %s %s", conn.udpTargetString(), conn.id, conn.conn.LocalAddr().String())
 
 	bytes := make([]byte, 2000)
 
@@ -621,7 +705,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 	for !p.exit {
 
 		conn.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
-		n, _, err := conn.conn.ReadFromUDP(bytes)
+		n, srcAddr, err := conn.conn.ReadFromUDP(bytes)
 		if err != nil {
 			nerr, ok := err.(net.Error)
 			if !ok || !nerr.Timeout() {
@@ -630,21 +714,39 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 				return
 			}
 		}
+		if n <= 0 {
+			continue
+		}
 
 		now := common.GetNowUpdateInSecond()
 		conn.activeSendTime = now
 
-		sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), bytes[:n],
+		targetAddr := conn.udpTargetString()
+		payload := bytes[:n]
+		if conn.udpViaProxy {
+			if conn.udpRelayAddr != nil && !sameUDPAddr(srcAddr, conn.udpRelayAddr) {
+				continue
+			}
+			parsedTarget, parsedPayload, parseErr := parseSocks5UDPDatagram(bytes[:n])
+			if parseErr != nil {
+				loggo.Debug("parse udp datagram from socks5 relay failed: %s", parseErr)
+				continue
+			}
+			targetAddr = parsedTarget
+			payload = parsedPayload
+		}
+
+		sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, targetAddr, id, (uint32)(MyMsg_DATA), payload,
 			conn.rproto, -1, responseKey, 0,
 			0, 0, 0, 0, 0,
 			0, p.cryptoConfig)
 
 		p.sendPacket++
-		p.sendPacketSize += (uint64)(n)
+		p.sendPacketSize += (uint64)(len(payload))
 
 		// Track sent traffic
 		if p.useMultiAuth && p.authManager != nil && conn.userID != 0 {
-			p.authManager.AddTraffic(conn.userID, int64(n), 0)
+			p.authManager.AddTraffic(conn.userID, int64(len(payload)), 0)
 		}
 	}
 }
@@ -696,10 +798,36 @@ func (p *Server) checkTimeoutConn() {
 			continue
 		}
 		if conn.close {
-			loggo.Info("close inactive conn %s %s", id, conn.ipaddrTarget.String())
+			loggo.Info("close inactive conn %s %s", id, conn.udpTargetString())
 			p.close(conn)
 		}
 	}
+}
+
+func (conn *ServerConn) udpTargetString() string {
+	if conn.udpTargetAddr != "" {
+		return conn.udpTargetAddr
+	}
+	if conn.ipaddrTarget != nil {
+		return conn.ipaddrTarget.String()
+	}
+	return "unknown"
+}
+
+func sameUDPAddr(a *net.UDPAddr, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if b.Port != 0 && a.Port != b.Port {
+		return false
+	}
+	if b.IP == nil || b.IP.IsUnspecified() {
+		return true
+	}
+	if a.IP == nil {
+		return false
+	}
+	return a.IP.Equal(b.IP)
 }
 
 func (p *Server) showNet() {

@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestReadSocks5RequestConnectDomain(t *testing.T) {
@@ -17,11 +18,11 @@ func TestReadSocks5RequestConnectDomain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readSocks5Request returned error: %v", err)
 	}
-	if req.cmd != socks5CmdConnect {
-		t.Fatalf("expected CONNECT command, got %d", req.cmd)
+	if req.Command != socks5CmdConnect {
+		t.Fatalf("expected CONNECT command, got %d", req.Command)
 	}
-	if req.addr != "example.com:443" {
-		t.Fatalf("unexpected addr: %s", req.addr)
+	if req.Address != "example.com:443" {
+		t.Fatalf("unexpected addr: %s", req.Address)
 	}
 }
 
@@ -35,15 +36,15 @@ func TestReadSocks5RequestUdpAssociateIPv4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readSocks5Request returned error: %v", err)
 	}
-	if req.cmd != socks5CmdUDPAssociate {
-		t.Fatalf("expected UDP ASSOCIATE command, got %d", req.cmd)
+	if req.Command != socks5CmdUDPAssociate {
+		t.Fatalf("expected UDP ASSOCIATE command, got %d", req.Command)
 	}
-	if req.addr != "0.0.0.0:0" {
-		t.Fatalf("unexpected addr: %s", req.addr)
+	if req.Address != "0.0.0.0:0" {
+		t.Fatalf("unexpected addr: %s", req.Address)
 	}
 }
 
-func TestAcceptSock5ConnRejectsUDPAssociate(t *testing.T) {
+func TestAcceptSock5ConnAcceptsUDPAssociate(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -58,7 +59,7 @@ func TestAcceptSock5ConnRejectsUDPAssociate(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		client := &Client{}
+		client := &Client{tcpaddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1")}}
 		client.AcceptSock5Conn(conn.(*net.TCPConn))
 	}()
 
@@ -91,9 +92,84 @@ func TestAcceptSock5ConnRejectsUDPAssociate(t *testing.T) {
 	if _, err := io.ReadFull(conn, resp); err != nil {
 		t.Fatalf("read udp associate response: %v", err)
 	}
-	if resp[0] != 0x05 || resp[1] != socks5ReplyCmdNA {
+	if resp[0] != 0x05 || resp[1] != socks5ReplySucceeded {
 		t.Fatalf("unexpected udp associate response: %v", resp)
 	}
+	conn.Close()
+	<-done
+}
+
+func TestSocks5UDPDatagramRoundTrip(t *testing.T) {
+	packet, err := buildSocks5UDPDatagram("example.com:443", []byte("hello"))
+	if err != nil {
+		t.Fatalf("buildSocks5UDPDatagram returned error: %v", err)
+	}
+	target, payload, err := parseSocks5UDPDatagram(packet)
+	if err != nil {
+		t.Fatalf("parseSocks5UDPDatagram returned error: %v", err)
+	}
+	if target != "example.com:443" {
+		t.Fatalf("unexpected target: %s", target)
+	}
+	if string(payload) != "hello" {
+		t.Fatalf("unexpected payload: %q", string(payload))
+	}
+}
+
+func TestDialUDPThroughProxyNoAuth(t *testing.T) {
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer tcpLn.Close()
+
+	udpLn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer udpLn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := tcpLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte{socks5Version, 0x00})
+
+		req, err := readSocks5Request(conn)
+		if err != nil || req.Command != socks5CmdUDPAssociate {
+			return
+		}
+		_ = writeSocks5Reply(conn, socks5ReplySucceeded, udpLn.LocalAddr().String())
+
+		buf := make([]byte, 1024)
+		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		_, _ = conn.Read(buf[:1])
+	}()
+
+	cfg, err := ParseForwardURL("socks5://" + tcpLn.Addr().String())
+	if err != nil {
+		t.Fatalf("ParseForwardURL returned error: %v", err)
+	}
+	assoc, err := DialUDPThroughProxy(cfg, time.Second)
+	if err != nil {
+		t.Fatalf("DialUDPThroughProxy returned error: %v", err)
+	}
+	defer assoc.ControlConn.Close()
+	defer assoc.UDPConn.Close()
+
+	if assoc.RelayAddr.String() != udpLn.LocalAddr().String() {
+		t.Fatalf("unexpected relay address: %s", assoc.RelayAddr.String())
+	}
+	assoc.ControlConn.Close()
 	<-done
 }
 

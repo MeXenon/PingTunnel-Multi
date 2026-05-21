@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -137,9 +138,13 @@ type ClientConn struct {
 	ipaddr         *net.UDPAddr
 	tcpaddr        *net.TCPAddr
 	id             string
+	addrKey        string
+	tcpmode        int
 	activeRecvTime time.Time
 	activeSendTime time.Time
 	close          bool
+	udpRelayConn   *net.UDPConn
+	udpTargetAddr  string
 
 	fm *network.FrameMgr
 }
@@ -340,7 +345,7 @@ func (p *Client) AcceptTcpConn(conn *net.TCPConn, targetAddr string) {
 	fm := network.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, p.tcpmode_buffersize, p.tcpmode_maxwin, p.tcpmode_resend_timems, p.tcpmode_compress, p.tcpmode_stat)
 
 	now := time.Now()
-	clientConn := &ClientConn{exit: false, tcpaddr: tcpsrcaddr, id: uuid, activeRecvTime: now, activeSendTime: now, close: false,
+	clientConn := &ClientConn{exit: false, tcpaddr: tcpsrcaddr, id: uuid, tcpmode: p.tcpmode, activeRecvTime: now, activeSendTime: now, close: false,
 		fm: fm}
 	p.addClientConn(uuid, tcpsrcaddr.String(), clientConn)
 	loggo.Info("client accept new local tcp %s %s", uuid, tcpsrcaddr.String())
@@ -556,7 +561,7 @@ func (p *Client) Accept() error {
 				continue
 			}
 			uuid := common.UniqueId()
-			clientConn = &ClientConn{exit: false, ipaddr: srcaddr, id: uuid, activeRecvTime: now, activeSendTime: now, close: false}
+			clientConn = &ClientConn{exit: false, ipaddr: srcaddr, id: uuid, tcpmode: 0, activeRecvTime: now, activeSendTime: now, close: false}
 			p.addClientConn(uuid, srcaddr.String(), clientConn)
 			loggo.Info("client accept new local udp %s %s", uuid, srcaddr.String())
 		}
@@ -564,7 +569,7 @@ func (p *Client) Accept() error {
 		clientConn.activeSendTime = now
 		sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, p.targetAddr, clientConn.id, (uint32)(MyMsg_DATA), bytes[:n],
 			SEND_PROTO, RECV_PROTO, p.key,
-			p.tcpmode, 0, 0, 0, 0, 0,
+			clientConn.tcpmode, 0, 0, 0, 0, 0,
 			p.timeout, p.cryptoConfig)
 
 		p.sequence++
@@ -621,7 +626,7 @@ func (p *Client) processPacket(packet *Packet) {
 	now := common.GetNowUpdateInSecond()
 	clientConn.activeRecvTime = now
 
-	if p.tcpmode > 0 {
+	if clientConn.tcpmode > 0 {
 		f := &network.Frame{}
 		err := oldproto.Unmarshal(packet.my.Data, f)
 		if err != nil {
@@ -635,7 +640,22 @@ func (p *Client) processPacket(packet *Packet) {
 			return
 		}
 		addr := clientConn.ipaddr
-		_, err := p.listenConn.WriteToUDP(packet.my.Data, addr)
+		var err error
+		if clientConn.udpRelayConn != nil {
+			udpTargetAddr := clientConn.udpTargetAddr
+			if packet.my.Target != "" {
+				udpTargetAddr = packet.my.Target
+			}
+			udpPacket, packetErr := buildSocks5UDPDatagram(udpTargetAddr, packet.my.Data)
+			if packetErr != nil {
+				loggo.Info("build socks5 udp datagram error %s", packetErr)
+				clientConn.close = true
+				return
+			}
+			_, err = clientConn.udpRelayConn.WriteToUDP(udpPacket, addr)
+		} else {
+			_, err = p.listenConn.WriteToUDP(packet.my.Data, addr)
+		}
 		if err != nil {
 			loggo.Info("WriteToUDP Error read udp %s", err)
 			clientConn.close = true
@@ -648,16 +668,26 @@ func (p *Client) processPacket(packet *Packet) {
 }
 
 func (p *Client) close(clientConn *ClientConn) {
+	if clientConn == nil || clientConn.exit {
+		return
+	}
 	clientConn.exit = true
-	p.deleteClientConn(clientConn.id, clientConn.ipaddr.String())
-	p.deleteClientConn(clientConn.id, clientConn.tcpaddr.String())
+	if clientConn.id != "" {
+		p.localIdToConnMap.Delete(clientConn.id)
+	}
+	if clientConn.addrKey != "" {
+		p.localAddrToConnMap.Delete(clientConn.addrKey)
+		return
+	}
+	if clientConn.ipaddr != nil {
+		p.localAddrToConnMap.Delete(clientConn.ipaddr.String())
+	}
+	if clientConn.tcpaddr != nil {
+		p.localAddrToConnMap.Delete(clientConn.tcpaddr.String())
+	}
 }
 
 func (p *Client) checkTimeoutConn() {
-
-	if p.tcpmode > 0 {
-		return
-	}
 
 	tmp := make(map[string]*ClientConn)
 	p.localIdToConnMap.Range(func(key, value interface{}) bool {
@@ -669,6 +699,9 @@ func (p *Client) checkTimeoutConn() {
 
 	now := common.GetNowUpdateInSecond()
 	for _, conn := range tmp {
+		if conn.tcpmode > 0 {
+			continue
+		}
 		diffrecv := now.Sub(conn.activeRecvTime)
 		diffsend := now.Sub(conn.activeSendTime)
 		if diffrecv > time.Second*(time.Duration(p.timeout)) || diffsend > time.Second*(time.Duration(p.timeout)) {
@@ -677,8 +710,15 @@ func (p *Client) checkTimeoutConn() {
 	}
 
 	for id, conn := range tmp {
+		if conn.tcpmode > 0 {
+			continue
+		}
 		if conn.close {
-			loggo.Info("close inactive conn %s %s", id, conn.ipaddr.String())
+			addr := conn.addrKey
+			if addr == "" && conn.ipaddr != nil {
+				addr = conn.ipaddr.String()
+			}
+			loggo.Info("close inactive conn %s %s", id, addr)
 			p.close(conn)
 		}
 	}
@@ -733,43 +773,243 @@ func (p *Client) AcceptSock5Conn(conn *net.TCPConn) {
 	req, err := readSocks5Request(conn)
 	if err != nil {
 		loggo.Error("error getting request: %s", err)
-		_ = writeSocks5Reply(conn, socks5FailureReplyForErr(err), "0.0.0.0:0")
+		_ = writeSocks5Reply(conn, socks5ReplyGeneralFailure, "0.0.0.0:0")
 		conn.Close()
 		return
 	}
 
-	if req.cmd != socks5CmdConnect {
-		_ = writeSocks5Reply(conn, socks5ReplyCmdNA, "0.0.0.0:0")
-		loggo.Info("socks command not supported: cmd=%d addr=%s", req.cmd, req.addr)
-		conn.Close()
-		return
-	}
-
-	// Sending connection established message immediately to client.
-	// This saves one round trip during socks connection setup.
-	// The bind address is not meaningful for this proxy path, so return zeroes.
-	err = writeSocks5Reply(conn, socks5ReplySucceeded, "0.0.0.0:0")
-	if err != nil {
-		loggo.Error("send connection confirmation: %s", err)
-		conn.Close()
-		return
-	}
-
-	loggo.Info("accept new sock5 conn: %s", req.addr)
-
-	if p.sock5_filter == nil {
-		p.AcceptTcpConn(conn, req.addr)
-	} else {
-		if (*p.sock5_filter)(req.addr) {
-			p.AcceptTcpConn(conn, req.addr)
+	switch req.Command {
+	case socks5CmdConnect:
+		err = writeSocks5Reply(conn, socks5ReplySucceeded, "0.0.0.0:0")
+		if err != nil {
+			loggo.Error("send connection confirmation: %s", err)
+			conn.Close()
 			return
 		}
-		p.AcceptDirectTcpConn(conn, req.addr)
+
+		loggo.Info("accept new sock5 tcp conn: %s", req.Address)
+
+		if p.sock5_filter == nil {
+			p.AcceptTcpConn(conn, req.Address)
+		} else {
+			if (*p.sock5_filter)(req.Address) {
+				p.AcceptTcpConn(conn, req.Address)
+				return
+			}
+			p.AcceptDirectTcpConn(conn, req.Address)
+		}
+	case socks5CmdUDPAssociate:
+		p.AcceptSock5UDPConn(conn, req.Address)
+	default:
+		_ = writeSocks5Reply(conn, socks5ReplyCommandNotSupported, "0.0.0.0:0")
+		loggo.Info("socks command not supported: cmd=%d addr=%s", req.Command, req.Address)
+		conn.Close()
 	}
+}
+
+func (p *Client) AcceptSock5UDPConn(conn *net.TCPConn, associateAddr string) {
+	relayBind := &net.UDPAddr{}
+	if p.tcpaddr != nil {
+		relayBind.IP = p.tcpaddr.IP
+		relayBind.Zone = p.tcpaddr.Zone
+	}
+
+	relayConn, err := net.ListenUDP("udp", relayBind)
+	if err != nil {
+		loggo.Error("create sock5 udp relay failed: %s", err)
+		_ = writeSocks5Reply(conn, socks5ReplyGeneralFailure, "0.0.0.0:0")
+		conn.Close()
+		return
+	}
+
+	relayAddr := copyUDPAddr(relayConn.LocalAddr().(*net.UDPAddr))
+	if relayAddr.IP == nil || relayAddr.IP.IsUnspecified() {
+		if localAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok && localAddr.IP != nil && !localAddr.IP.IsUnspecified() {
+			relayAddr.IP = append(net.IP(nil), localAddr.IP...)
+			relayAddr.Zone = localAddr.Zone
+		}
+	}
+	if relayAddr.IP == nil {
+		relayAddr.IP = net.IPv4zero
+	}
+
+	if err := writeSocks5Reply(conn, socks5ReplySucceeded, relayAddr.String()); err != nil {
+		loggo.Error("send udp associate confirmation: %s", err)
+		relayConn.Close()
+		conn.Close()
+		return
+	}
+
+	loggo.Info("accept new sock5 udp associate: %s relay %s", associateAddr, relayAddr.String())
+
+	expectedIP, expectedPort := parseSock5UDPAssociateHint(associateAddr)
+	udpExit := make(chan struct{})
+	go func() {
+		defer close(udpExit)
+		p.recvSock5UDP(relayConn, expectedIP, expectedPort)
+	}()
+
+	ctrlBuf := make([]byte, 1)
+	for !p.exit {
+		conn.SetReadDeadline(time.Now().Add(time.Millisecond * 200))
+		_, err := conn.Read(ctrlBuf)
+		if err != nil {
+			nerr, ok := err.(net.Error)
+			if ok && nerr.Timeout() {
+				continue
+			}
+			break
+		}
+	}
+
+	conn.Close()
+	relayConn.Close()
+	<-udpExit
+	p.closeSock5UDPFlows(relayConn)
+
+	loggo.Info("close sock5 udp associate relay %s", relayAddr.String())
+}
+
+func (p *Client) recvSock5UDP(relayConn *net.UDPConn, expectedIP net.IP, expectedPort int) {
+	defer common.CrashLog()
+
+	p.workResultLock.Add(1)
+	defer p.workResultLock.Done()
+
+	bytes := make([]byte, 65535)
+	var sourceAddr *net.UDPAddr
+
+	for !p.exit {
+		relayConn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
+		n, srcaddr, err := relayConn.ReadFromUDP(bytes)
+		if err != nil {
+			nerr, ok := err.(net.Error)
+			if ok && nerr.Timeout() {
+				continue
+			}
+			if !p.exit {
+				loggo.Info("Error read sock5 udp %s", err)
+			}
+			return
+		}
+		if n <= 0 {
+			continue
+		}
+
+		if !p.allowSock5UDPSource(srcaddr, expectedIP, expectedPort, &sourceAddr) {
+			loggo.Debug("drop unexpected sock5 udp source %s", srcaddr.String())
+			continue
+		}
+
+		targetAddr, payload, err := parseSocks5UDPDatagram(bytes[:n])
+		if err != nil {
+			loggo.Debug("parse sock5 udp datagram failed: %s", err)
+			continue
+		}
+
+		now := common.GetNowUpdateInSecond()
+		connKey := p.sock5UDPConnKey(relayConn, srcaddr, targetAddr)
+		clientConn := p.getClientConnByAddr(connKey)
+		if clientConn == nil {
+			if p.maxconn > 0 && p.localIdToConnMapSize >= p.maxconn {
+				loggo.Info("too many connections %d, client accept new sock5 udp fail %s", p.localIdToConnMapSize, srcaddr.String())
+				continue
+			}
+			uuid := common.UniqueId()
+			clientConn = &ClientConn{
+				exit:           false,
+				ipaddr:         copyUDPAddr(srcaddr),
+				id:             uuid,
+				tcpmode:        0,
+				activeRecvTime: now,
+				activeSendTime: now,
+				close:          false,
+				udpRelayConn:   relayConn,
+				udpTargetAddr:  targetAddr,
+			}
+			p.addClientConn(uuid, connKey, clientConn)
+			loggo.Info("client accept new sock5 udp %s %s -> %s", uuid, srcaddr.String(), targetAddr)
+		}
+
+		clientConn.activeSendTime = now
+
+		sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), payload,
+			SEND_PROTO, RECV_PROTO, p.key,
+			0, 0, 0, 0, 0, 0,
+			p.timeout, p.cryptoConfig)
+
+		p.sequence++
+		p.sendPacket++
+		p.sendPacketSize += (uint64)(len(payload))
+	}
+}
+
+func (p *Client) allowSock5UDPSource(srcaddr *net.UDPAddr, expectedIP net.IP, expectedPort int, sourceAddr **net.UDPAddr) bool {
+	if expectedIP != nil && !expectedIP.Equal(srcaddr.IP) {
+		return false
+	}
+	if expectedPort > 0 && srcaddr.Port != expectedPort {
+		return false
+	}
+	if *sourceAddr == nil {
+		*sourceAddr = copyUDPAddr(srcaddr)
+		return true
+	}
+	return (*sourceAddr).IP.Equal(srcaddr.IP) && (*sourceAddr).Port == srcaddr.Port
+}
+
+func (p *Client) closeSock5UDPFlows(relayConn *net.UDPConn) {
+	var tmp []*ClientConn
+	p.localIdToConnMap.Range(func(key, value interface{}) bool {
+		clientConn := value.(*ClientConn)
+		if clientConn.tcpmode == 0 && clientConn.udpRelayConn == relayConn {
+			tmp = append(tmp, clientConn)
+		}
+		return true
+	})
+
+	for _, clientConn := range tmp {
+		p.close(clientConn)
+	}
+}
+
+func (p *Client) sock5UDPConnKey(relayConn *net.UDPConn, srcaddr *net.UDPAddr, targetAddr string) string {
+	return relayConn.LocalAddr().String() + "|" + srcaddr.String() + "|" + targetAddr
+}
+
+func copyUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	return &net.UDPAddr{
+		IP:   append(net.IP(nil), addr.IP...),
+		Port: addr.Port,
+		Zone: addr.Zone,
+	}
+}
+
+func parseSock5UDPAssociateHint(addr string) (net.IP, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, 0
+	}
+
+	var ip net.IP
+	if parsedIP := net.ParseIP(host); parsedIP != nil && !parsedIP.IsUnspecified() {
+		ip = parsedIP
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		port = 0
+	}
+
+	return ip, port
 }
 
 func (p *Client) addClientConn(uuid string, addr string, clientConn *ClientConn) {
 
+	clientConn.addrKey = addr
 	p.localAddrToConnMap.Store(addr, clientConn)
 	p.localIdToConnMap.Store(uuid, clientConn)
 }
