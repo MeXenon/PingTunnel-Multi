@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,13 +38,14 @@ var (
 
 // AuthUser represents a user from the database
 type AuthUser struct {
-	ID         int64
-	Username   string
-	Key        int64
-	QuotaBytes int64
-	UsedBytes  int64
-	Enabled    bool
-	IsMain     bool
+	ID          int64
+	Username    string
+	Key         int64
+	QuotaBytes  int64
+	UsedBytes   int64
+	MaxSessions int
+	Enabled     bool
+	IsMain      bool
 }
 
 // AuthManager handles multi-user authentication and traffic accounting
@@ -110,6 +112,10 @@ func NewAuthManager(dbPath string) (*AuthManager, error) {
 		stopChan:                make(chan struct{}),
 	}
 
+	if err := am.ensureUserLimitColumns(); err != nil {
+		return nil, err
+	}
+
 	if err := am.loadUsers(); err != nil {
 		return nil, err
 	}
@@ -131,7 +137,7 @@ func NewAuthManager(dbPath string) (*AuthManager, error) {
 // loadUsers loads all users from database into cache
 func (am *AuthManager) loadUsers() error {
 	rows, err := am.db.Query(`
-		SELECT id, username, key, quota_bytes, used_bytes, enabled, is_main
+		SELECT id, username, key, quota_bytes, used_bytes, COALESCE(max_sessions, 0), enabled, is_main
 		FROM users WHERE enabled = 1
 	`)
 	if err != nil {
@@ -146,8 +152,11 @@ func (am *AuthManager) loadUsers() error {
 	for rows.Next() {
 		var u AuthUser
 		var enabled, isMain int
-		if err := rows.Scan(&u.ID, &u.Username, &u.Key, &u.QuotaBytes, &u.UsedBytes, &enabled, &isMain); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Key, &u.QuotaBytes, &u.UsedBytes, &u.MaxSessions, &enabled, &isMain); err != nil {
 			return err
+		}
+		if u.MaxSessions < 0 {
+			u.MaxSessions = 0
 		}
 		u.Enabled = enabled == 1
 		u.IsMain = isMain == 1
@@ -194,24 +203,66 @@ func (am *AuthManager) ValidateKey(key int) (*AuthUser, error) {
 // CanConnect checks if user can connect.
 func (am *AuthManager) CanConnect(key int, clientIP string) bool {
 	now := time.Now()
+	key64 := int64(key)
 	sessionID := sessionMapKey(int64(key), clientIP)
 
-	am.sessionMu.RLock()
-	info, exists := am.activeSessions[sessionID]
-	am.sessionMu.RUnlock()
+	am.mu.RLock()
+	user := am.userCache[key64]
+	maxSessions := 0
+	userID := int64(0)
+	if user != nil {
+		maxSessions = user.MaxSessions
+		userID = user.ID
+	}
+	am.mu.RUnlock()
 
-	if !exists {
-		return true
+	var staleSessions []SessionInfo
+	var reserved *SessionInfo
+	allowed := true
+
+	am.sessionMu.Lock()
+	if info, exists := am.activeSessions[sessionID]; exists {
+		if now.Sub(info.LastActive) <= am.sessionTimeout {
+			am.sessionMu.Unlock()
+			return true
+		}
+		delete(am.activeSessions, sessionID)
+		staleSessions = append(staleSessions, *info)
 	}
 
-	if now.Sub(info.LastActive) > am.sessionTimeout {
-		am.sessionMu.Lock()
-		delete(am.activeSessions, sessionID)
-		am.sessionMu.Unlock()
+	if maxSessions > 0 {
+		activeForUser := 0
+		for id, info := range am.activeSessions {
+			if now.Sub(info.LastActive) > am.sessionTimeout {
+				delete(am.activeSessions, id)
+				staleSessions = append(staleSessions, *info)
+				continue
+			}
+			if info.Key == key64 {
+				activeForUser++
+			}
+		}
+		if activeForUser >= maxSessions {
+			allowed = false
+		} else {
+			reserved = &SessionInfo{
+				Key:        key64,
+				UserID:     userID,
+				ClientIP:   clientIP,
+				LastActive: now,
+			}
+			am.activeSessions[sessionID] = reserved
+		}
+	}
+	am.sessionMu.Unlock()
+
+	for _, info := range staleSessions {
 		am.deleteSessionRow(info.UserID, info.ClientIP)
 	}
-
-	return true
+	if reserved != nil {
+		am.upsertSessionRow(reserved)
+	}
+	return allowed
 }
 
 // TouchSession updates (or creates) the session entry for a key/client IP.
@@ -354,6 +405,22 @@ func (am *AuthManager) cleanupSessions() {
 	now := time.Now()
 	var staleSessions []SessionInfo
 
+	am.mu.RLock()
+	users := make(map[int64]AuthUser, len(am.userCache))
+	for key, user := range am.userCache {
+		if user == nil {
+			continue
+		}
+		users[key] = *user
+	}
+	am.mu.RUnlock()
+
+	type trackedSession struct {
+		id   string
+		info *SessionInfo
+	}
+	byKey := make(map[int64][]trackedSession)
+
 	am.sessionMu.Lock()
 	for sessionID, info := range am.activeSessions {
 		if now.Sub(info.LastActive) > am.sessionTimeout {
@@ -362,12 +429,27 @@ func (am *AuthManager) cleanupSessions() {
 			continue
 		}
 
-		am.mu.RLock()
-		_, exists := am.userCache[info.Key]
-		am.mu.RUnlock()
+		_, exists := users[info.Key]
 		if !exists {
 			delete(am.activeSessions, sessionID)
 			staleSessions = append(staleSessions, *info)
+			continue
+		}
+		byKey[info.Key] = append(byKey[info.Key], trackedSession{id: sessionID, info: info})
+	}
+	for key, sessions := range byKey {
+		user := users[key]
+		if user.MaxSessions <= 0 || len(sessions) <= user.MaxSessions {
+			continue
+		}
+		sort.SliceStable(sessions, func(i, j int) bool {
+			return sessions[i].info.LastActive.After(sessions[j].info.LastActive)
+		})
+		for _, session := range sessions[user.MaxSessions:] {
+			if current, ok := am.activeSessions[session.id]; ok {
+				delete(am.activeSessions, session.id)
+				staleSessions = append(staleSessions, *current)
+			}
 		}
 	}
 	am.sessionMu.Unlock()
@@ -435,6 +517,46 @@ func (am *AuthManager) ensureSessionTable() error {
 		CREATE INDEX IF NOT EXISTS idx_usage_log_user ON usage_log(user_id);
 		CREATE INDEX IF NOT EXISTS idx_usage_log_time ON usage_log(logged_at);
 	`)
+	return err
+}
+
+func (am *AuthManager) ensureUserLimitColumns() error {
+	var name string
+	err := am.db.QueryRow("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'users'").Scan(&name)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	rows, err := am.db.Query("PRAGMA table_info(users)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	hasMaxSessions := false
+	for rows.Next() {
+		var cid int
+		var columnName, columnType string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &columnName, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(columnName, "max_sessions") {
+			hasMaxSessions = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasMaxSessions {
+		return nil
+	}
+	_, err = am.db.Exec("ALTER TABLE users ADD COLUMN max_sessions INTEGER DEFAULT 0")
 	return err
 }
 

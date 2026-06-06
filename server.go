@@ -340,9 +340,9 @@ func (p *Server) processPacket(packet *Packet) {
 			return
 		}
 
-		// Check single session enforcement
+		// Enforce the per-user session cap loaded from the panel auth DB.
 		if !p.authManager.CanConnect(key, clientIP) {
-			loggo.Info("Session already exists for key %d from different IP", packet.my.Key)
+			loggo.Info("Session limit reached for key %d from %s", packet.my.Key, clientIP)
 			p.remoteError(packet.echoId, packet.echoSeq, packet.my.Id, (int)(packet.my.Rproto), packet.src, key)
 			return
 		}
