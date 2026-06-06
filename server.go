@@ -423,12 +423,6 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 	}
 
 	addr := packet.my.Target
-	if p.isConnError(addr) {
-		loggo.Info("addr connect Error before: %s %s", id, addr)
-		p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
-		return nil
-	}
-
 	// Get user ID for this connection
 	var userID int64
 	var userKey int
@@ -437,6 +431,14 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 		userID = p.connToUser[id]
 		p.connUserMu.RUnlock()
 		userKey = int(packet.my.Key)
+	}
+	forwardConfig := p.forwardConfigForKey(userKey)
+	connErrorKey := p.connErrorKey(addr, forwardConfig)
+
+	if p.isConnError(connErrorKey) {
+		loggo.Info("addr connect Error before: %s %s", id, addr)
+		p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
+		return nil
 	}
 
 	if packet.my.Tcpmode > 0 {
@@ -452,15 +454,15 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 		go func() {
 			var c net.Conn
 			var err error
-			if p.forwardConfig != nil {
-				c, err = DialThroughProxy(p.forwardConfig, addr, time.Millisecond*time.Duration(p.connecttmeout))
+			if forwardConfig != nil {
+				c, err = DialThroughProxy(forwardConfig, addr, time.Millisecond*time.Duration(p.connecttmeout))
 			} else {
 				c, err = net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connecttmeout))
 			}
 			if err != nil {
 				loggo.Error("Error listening for tcp packets: %s %s", id, err.Error())
 				localConn.tcpErr = err
-				p.addConnError(addr)
+				p.addConnError(connErrorKey)
 				close(localConn.tcpReady)
 				notifyActivity(localConn.activity)
 				return
@@ -478,16 +480,16 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 		return localConn
 
 	} else {
-		if p.forwardConfig != nil {
-			if p.forwardConfig.Scheme != "socks5" {
-				loggo.Error("UDP forwarding requires SOCKS5 proxy, got %s", p.forwardConfig.Scheme)
+		if forwardConfig != nil {
+			if forwardConfig.Scheme != "socks5" {
+				loggo.Error("UDP forwarding requires SOCKS5 proxy, got %s", forwardConfig.Scheme)
 				p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
-				p.addConnError(addr)
+				p.addConnError(connErrorKey)
 				return nil
 			}
 
 			if isDNSForwardTarget(addr) {
-				response, dnsErr := exchangeDNSOverTCPViaProxy(p.forwardConfig, addr, packet.my.Data, time.Millisecond*time.Duration(p.connecttmeout))
+				response, dnsErr := exchangeDNSOverTCPViaProxy(forwardConfig, addr, packet.my.Data, time.Millisecond*time.Duration(p.connecttmeout))
 				if dnsErr == nil {
 					sendICMP(packet.echoId, packet.echoSeq, *p.conn, packet.src, addr, id, (uint32)(MyMsg_DATA), response,
 						(int)(packet.my.Rproto), -1, responseKey, 0,
@@ -503,11 +505,11 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 				loggo.Error("DNS over TCP proxy fallback failed: %s %s", id, dnsErr.Error())
 			}
 
-			association, err := DialUDPThroughProxy(p.forwardConfig, time.Millisecond*time.Duration(p.connecttmeout))
+			association, err := DialUDPThroughProxy(forwardConfig, time.Millisecond*time.Duration(p.connecttmeout))
 			if err != nil {
 				loggo.Error("Error creating udp forward association: %s %s", id, err.Error())
 				p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
-				p.addConnError(addr)
+				p.addConnError(connErrorKey)
 				return nil
 			}
 
@@ -538,7 +540,7 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 		if err != nil {
 			loggo.Error("Error listening for udp packets: %s %s", id, err.Error())
 			p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src, responseKey)
-			p.addConnError(addr)
+			p.addConnError(connErrorKey)
 			return nil
 		}
 		targetConn := c.(*net.UDPConn)
@@ -1127,6 +1129,19 @@ func (p *Server) remoteError(echoId int, echoSeq int, uuid string, rprpto int, s
 		rprpto, -1, key,
 		0, 0, 0, 0, 0, 0, 0,
 		p.cryptoConfig)
+}
+
+func (p *Server) forwardConfigForKey(key int) *ForwardConfig {
+	if key != 0 && p.useMultiAuth && p.authManager != nil {
+		if forward, hasOverride := p.authManager.ForwardForKey(key); hasOverride {
+			return forward
+		}
+	}
+	return p.forwardConfig
+}
+
+func (p *Server) connErrorKey(addr string, forward *ForwardConfig) string {
+	return forward.CacheKey() + "|" + addr
 }
 
 func (p *Server) addConnError(addr string) {

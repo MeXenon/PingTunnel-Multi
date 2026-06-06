@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,6 +29,9 @@ type ForwardConfig struct {
 
 func ParseForwardURL(rawURL string) (*ForwardConfig, error) {
 	if rawURL == "" {
+		return nil, nil
+	}
+	if isDirectForwardURL(rawURL) {
 		return nil, nil
 	}
 
@@ -63,8 +67,24 @@ func ParseForwardURL(rawURL string) (*ForwardConfig, error) {
 	}, nil
 }
 
+func isDirectForwardURL(rawURL string) bool {
+	value := strings.TrimSpace(strings.ToLower(rawURL))
+	return value == "direct" || value == "direct://" || value == "none" || value == "off"
+}
+
 func (f *ForwardConfig) Address() string {
 	return net.JoinHostPort(f.Host, strconv.Itoa(f.Port))
+}
+
+func (f *ForwardConfig) CacheKey() string {
+	if f == nil {
+		return "direct"
+	}
+	auth := ""
+	if f.Username != "" || f.Password != "" {
+		auth = f.Username + ":" + f.Password + "@"
+	}
+	return f.Scheme + "://" + auth + f.Address()
 }
 
 func DialThroughProxy(config *ForwardConfig, targetAddr string, timeout time.Duration) (net.Conn, error) {

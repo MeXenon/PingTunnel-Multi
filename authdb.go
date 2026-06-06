@@ -44,6 +44,9 @@ type AuthUser struct {
 	QuotaBytes  int64
 	UsedBytes   int64
 	MaxSessions int
+	ForwardURL  string
+	Forward     *ForwardConfig
+	ForwardSet  bool
 	Enabled     bool
 	IsMain      bool
 }
@@ -137,7 +140,7 @@ func NewAuthManager(dbPath string) (*AuthManager, error) {
 // loadUsers loads all users from database into cache
 func (am *AuthManager) loadUsers() error {
 	rows, err := am.db.Query(`
-		SELECT id, username, key, quota_bytes, used_bytes, COALESCE(max_sessions, 0), enabled, is_main
+		SELECT id, username, key, quota_bytes, used_bytes, COALESCE(max_sessions, 0), COALESCE(forward_proxy, ''), enabled, is_main
 		FROM users WHERE enabled = 1
 	`)
 	if err != nil {
@@ -152,11 +155,27 @@ func (am *AuthManager) loadUsers() error {
 	for rows.Next() {
 		var u AuthUser
 		var enabled, isMain int
-		if err := rows.Scan(&u.ID, &u.Username, &u.Key, &u.QuotaBytes, &u.UsedBytes, &u.MaxSessions, &enabled, &isMain); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Key, &u.QuotaBytes, &u.UsedBytes, &u.MaxSessions, &u.ForwardURL, &enabled, &isMain); err != nil {
 			return err
 		}
 		if u.MaxSessions < 0 {
 			u.MaxSessions = 0
+		}
+		u.ForwardURL = strings.TrimSpace(u.ForwardURL)
+		if u.ForwardURL != "" {
+			u.ForwardSet = true
+			if isDirectForwardURL(u.ForwardURL) {
+				u.Forward = nil
+			} else {
+				forward, err := ParseForwardURL(u.ForwardURL)
+				if err != nil {
+					loggo.Error("invalid forward_proxy for user %s key %d: %s", u.Username, u.Key, err.Error())
+					u.ForwardSet = false
+					u.ForwardURL = ""
+				} else {
+					u.Forward = forward
+				}
+			}
 		}
 		u.Enabled = enabled == 1
 		u.IsMain = isMain == 1
@@ -493,6 +512,19 @@ func (am *AuthManager) GetActiveKeys() []int {
 	return keys
 }
 
+// ForwardForKey returns a user's explicit forward override. The boolean is
+// false when the user should inherit the process-level forward configuration.
+func (am *AuthManager) ForwardForKey(key int) (*ForwardConfig, bool) {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	user := am.userCache[int64(key)]
+	if user == nil || !user.Enabled || !user.ForwardSet {
+		return nil, false
+	}
+	return user.Forward, true
+}
+
 func (am *AuthManager) ensureSessionTable() error {
 	_, err := am.db.Exec(`
 		CREATE TABLE IF NOT EXISTS active_sessions (
@@ -537,6 +569,7 @@ func (am *AuthManager) ensureUserLimitColumns() error {
 	defer rows.Close()
 
 	hasMaxSessions := false
+	hasForwardProxy := false
 	for rows.Next() {
 		var cid int
 		var columnName, columnType string
@@ -547,17 +580,25 @@ func (am *AuthManager) ensureUserLimitColumns() error {
 		}
 		if strings.EqualFold(columnName, "max_sessions") {
 			hasMaxSessions = true
-			break
+		}
+		if strings.EqualFold(columnName, "forward_proxy") {
+			hasForwardProxy = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if hasMaxSessions {
-		return nil
+	if !hasMaxSessions {
+		if _, err := am.db.Exec("ALTER TABLE users ADD COLUMN max_sessions INTEGER DEFAULT 0"); err != nil {
+			return err
+		}
 	}
-	_, err = am.db.Exec("ALTER TABLE users ADD COLUMN max_sessions INTEGER DEFAULT 0")
-	return err
+	if !hasForwardProxy {
+		if _, err := am.db.Exec("ALTER TABLE users ADD COLUMN forward_proxy TEXT DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (am *AuthManager) clearActiveSessions() {

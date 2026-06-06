@@ -211,7 +211,73 @@ func TestAuthManagerMigratesLegacyUsersWithoutMaxSessions(t *testing.T) {
 	if maxSessions != 0 {
 		t.Fatalf("legacy max_sessions = %d, want 0", maxSessions)
 	}
+	var forwardProxy string
+	if err := checkDB.QueryRow("SELECT forward_proxy FROM users WHERE username = 'legacy'").Scan(&forwardProxy); err != nil {
+		t.Fatalf("read migrated forward_proxy: %v", err)
+	}
+	if forwardProxy != "" {
+		t.Fatalf("legacy forward_proxy = %q, want empty", forwardProxy)
+	}
 	if user := am.userCache[100000008]; user == nil || user.MaxSessions != 0 {
 		t.Fatalf("legacy user cache = %#v, want max_sessions 0", user)
+	}
+}
+
+func TestAuthManagerLoadsPerUserForwardOverrides(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "forward-auth.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT UNIQUE NOT NULL,
+			key INTEGER UNIQUE NOT NULL,
+			quota_bytes INTEGER DEFAULT 0,
+			used_bytes INTEGER DEFAULT 0,
+			max_sessions INTEGER DEFAULT 0,
+			forward_proxy TEXT DEFAULT '',
+			enabled INTEGER DEFAULT 1,
+			is_main INTEGER DEFAULT 0
+		)
+	`)
+	if err != nil {
+		t.Fatalf("create users: %v", err)
+	}
+	for _, row := range []struct {
+		username string
+		key      int
+		forward  string
+	}{
+		{"inherit", 100000009, ""},
+		{"direct", 100000010, "direct"},
+		{"socks", 100000011, "socks5://127.0.0.1:1080"},
+		{"invalid", 100000012, "ftp://127.0.0.1:21"},
+	} {
+		if _, err = db.Exec("INSERT INTO users (username, key, forward_proxy, enabled) VALUES (?, ?, ?, 1)", row.username, row.key, row.forward); err != nil {
+			t.Fatalf("insert user %s: %v", row.username, err)
+		}
+	}
+	_ = db.Close()
+
+	am, err := NewAuthManager(dbPath)
+	if err != nil {
+		t.Fatalf("new auth manager: %v", err)
+	}
+	t.Cleanup(am.Stop)
+
+	if cfg, ok := am.ForwardForKey(100000009); ok || cfg != nil {
+		t.Fatalf("inherit user returned cfg=%#v ok=%v, want no override", cfg, ok)
+	}
+	if cfg, ok := am.ForwardForKey(100000010); !ok || cfg != nil {
+		t.Fatalf("direct user returned cfg=%#v ok=%v, want direct override", cfg, ok)
+	}
+	cfg, ok := am.ForwardForKey(100000011)
+	if !ok || cfg == nil || cfg.Scheme != "socks5" || cfg.Address() != "127.0.0.1:1080" {
+		t.Fatalf("socks user returned cfg=%#v ok=%v, want socks5 override", cfg, ok)
+	}
+	if cfg, ok := am.ForwardForKey(100000012); ok || cfg != nil {
+		t.Fatalf("invalid user returned cfg=%#v ok=%v, want ignored override", cfg, ok)
 	}
 }
